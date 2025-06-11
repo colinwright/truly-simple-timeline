@@ -1,11 +1,5 @@
-//
-//  TrulySimpleTimelineApp.swift
-//  TrulySimpleTimeline
-//
-//  Created by Colin Wright on 6/11/25.
-//
-
 import SwiftUI
+import SwiftData
 
 @main
 struct TrulySimpleTimelineApp: App {
@@ -13,5 +7,7 @@ struct TrulySimpleTimelineApp: App {
         WindowGroup {
             ContentView()
         }
+        // This line creates the database and prepares it for our Event model.
+        .modelContainer(for: Event.self)
     }
 }
