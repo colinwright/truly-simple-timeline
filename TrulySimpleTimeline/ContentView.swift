@@ -1,11 +1,20 @@
 import SwiftUI
 import SwiftData
 
-// MARK: - Model
+// MARK: - Models & Configuration
 
-enum TimePrecision: Int, Codable, CaseIterable {
+enum TimePrecision: Int, Codable, CaseIterable, CustomStringConvertible {
     case day = 0, time = 1
-    var description: String { switch self { case .day: return "Date Only"; case .time: return "Date & Time" } }
+    var description: String {
+        switch self {
+        case .day: return "Date"
+        case .time: return "Date & Time"
+        }
+    }
+}
+
+enum TimelineOrientation {
+    case vertical, horizontal
 }
 
 @Model
@@ -24,15 +33,51 @@ final class Event {
         self.precision = precision
     }
     
+    var isDuration: Bool {
+        endDate != nil
+    }
+
     var duration: TimeInterval {
         guard let endDate else { return 0 }
-        return endDate.timeIntervalSince(startDate)
+        return max(0, endDate.timeIntervalSince(startDate))
     }
     
-    var effectiveInterval: DateInterval {
-        DateInterval(start: startDate, duration: max(3600, duration))
+    func layoutInterval(using metrics: TimelineMetrics, zoomScale: CGFloat) -> DateInterval {
+        let minLengthInSeconds = (44 / metrics.pointsPerSecond(at: zoomScale))
+        let effectiveDuration = max(self.duration, minLengthInSeconds)
+        return DateInterval(start: self.startDate, duration: effectiveDuration)
     }
 }
+
+@Observable
+class TimelineConfiguration {
+    private let startDateKey = "timelineStartDate"
+    private let endDateKey = "timelineEndDate"
+
+    var startDate: Date
+    var endDate: Date
+    var isConfigured: Bool = false
+
+    init() {
+        if let startInterval = UserDefaults.standard.object(forKey: startDateKey) as? TimeInterval,
+           let endInterval = UserDefaults.standard.object(forKey: endDateKey) as? TimeInterval {
+            self.startDate = Date(timeIntervalSince1970: startInterval)
+            self.endDate = Date(timeIntervalSince1970: endInterval)
+            self.isConfigured = true
+        } else {
+            self.startDate = .now.addingTimeInterval(-86400 * 30)
+            self.endDate = .now
+            self.isConfigured = false
+        }
+    }
+
+    func save() {
+        UserDefaults.standard.set(startDate.timeIntervalSince1970, forKey: startDateKey)
+        UserDefaults.standard.set(endDate.timeIntervalSince1970, forKey: endDateKey)
+        self.isConfigured = true
+    }
+}
+
 
 // MARK: - Main View
 
@@ -40,437 +85,552 @@ struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Query(sort: \Event.startDate) private var events: [Event]
 
-    @State private var isShowingAddEventSheet = false
+    @State private var config = TimelineConfiguration()
+    @State private var showSettings = false
+    @State private var showEventEditor = false
     @State private var eventToEdit: Event?
 
     var body: some View {
-        NavigationView {
-            Group {
-                if events.isEmpty {
-                    ContentUnavailableView("No Events Yet", systemImage: "calendar.badge.plus", description: Text("Tap the + button to add your first event."))
-                } else {
-                    GeometryReader { geometry in
+        NavigationStack {
+            GeometryReader { geometry in
+                let orientation: TimelineOrientation = geometry.size.width > geometry.size.height ? .horizontal : .vertical
+                
+                Group {
+                    if !config.isConfigured {
+                        ContentUnavailableView( "Setup Your Timeline", systemImage: "calendar.badge.plus", description: Text("Define a start and end date for your timeline to begin.") )
+                    } else if events.isEmpty {
+                        ContentUnavailableView( "No Events Yet", systemImage: "note.text.badge.plus", description: Text("Tap the + button to add your first event.") )
+                    } else {
                         TimelineView(
                             events: events,
-                            eventToEdit: $eventToEdit,
-                            visibleSize: geometry.size
+                            config: config,
+                            orientation: orientation,
+                            eventToEdit: $eventToEdit
                         )
                     }
                 }
-            }
-            .navigationTitle("")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button { isShowingAddEventSheet = true } label: { Image(systemName: "plus") }
+                .navigationTitle("Timeline")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItemGroup(placement: .navigationBarTrailing) {
+                        Button { showEventEditor = true } label: { Image(systemName: "plus") }
+                        Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                    }
                 }
             }
-            .toolbarBackground(.visible, for: .navigationBar)
-            .toolbarBackground(Color(.systemBackground), for: .navigationBar)
-            .sheet(isPresented: $isShowingAddEventSheet) { AddEventView(event: nil) }
-            .sheet(item: $eventToEdit) { event in AddEventView(event: event) }
+            .sheet(isPresented: $showSettings) { TimelineSettingsView(config: config) }
+            .sheet(isPresented: $showEventEditor) { EventEditorView(event: nil, timelineRange: config.dateRange) }
+            .sheet(item: $eventToEdit) { event in EventEditorView(event: event, timelineRange: config.dateRange) }
+            .onAppear {
+                if !config.isConfigured {
+                    showSettings = true
+                }
+            }
         }
     }
 }
 
-// MARK: - Proportional Timeline Components
+extension TimelineConfiguration {
+    var dateRange: ClosedRange<Date> {
+        startDate...endDate
+    }
+}
 
+// MARK: - Timeline View & Components
+
+struct TimelineView: View {
+    let events: [Event]
+    let config: TimelineConfiguration
+    let orientation: TimelineOrientation
+    @Binding var eventToEdit: Event?
+    
+    @State private var zoomScale: CGFloat = 1.0
+    @State private var initialZoomSet = false
+
+    private var metrics: TimelineMetrics {
+        TimelineMetrics(bounds: config.dateRange)
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            TimelineScrollView(
+                events: events,
+                metrics: metrics,
+                orientation: orientation,
+                visibleSize: geometry.size,
+                zoomScale: $zoomScale,
+                eventToEdit: $eventToEdit
+            )
+            .onAppear {
+                if !initialZoomSet {
+                    zoomScale = calculateMinZoom(for: geometry.size)
+                    initialZoomSet = true
+                }
+            }
+            .onChange(of: orientation) {
+                zoomScale = calculateMinZoom(for: geometry.size)
+            }
+        }
+    }
+    
+    private func calculateMinZoom(for visibleSize: CGSize) -> CGFloat {
+        let axisLength = orientation == .vertical ? visibleSize.height : visibleSize.width
+        let totalDuration = config.endDate.timeIntervalSince(config.startDate)
+        guard totalDuration > 0, axisLength > 0 else { return 1.0 }
+        
+        let totalLengthAtScaleOne = metrics.length(for: totalDuration, at: 1.0)
+        return totalLengthAtScaleOne > axisLength ? axisLength / totalLengthAtScaleOne : 1.0
+    }
+}
+
+struct TimelineScrollView: View {
+    let events: [Event]
+    let metrics: TimelineMetrics
+    let orientation: TimelineOrientation
+    let visibleSize: CGSize
+    
+    @Binding var zoomScale: CGFloat
+    @Binding var eventToEdit: Event?
+
+    @State private var scrollPosition: CGFloat = 0
+    @State private var initialZoomScale: CGFloat?
+    @State private var draggingEventID: ObjectIdentifier?
+    @State private var dragOffset: CGVector = .zero
+
+    private let axisSize: CGFloat = 60
+    private let maxZoomScale: CGFloat = 200.0
+    private let scrollCoordinateSpace = "scroll"
+    private let contentID = "timelineContent"
+    
+    private var layouts: [LayoutEvent] {
+        let crossAxisSize = orientation == .vertical ? visibleSize.width - axisSize : visibleSize.height - axisSize
+        return generateLayouts(containerCrossAxisSize: crossAxisSize)
+    }
+    
+    private var contentSize: CGSize {
+        let totalLength = metrics.length(for: metrics.bounds.upperBound.timeIntervalSince(metrics.bounds.lowerBound), at: zoomScale)
+        return orientation == .vertical
+            ? CGSize(width: visibleSize.width, height: totalLength)
+            : CGSize(width: totalLength, height: visibleSize.height)
+    }
+    
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView(orientation == .vertical ? .vertical : .horizontal, showsIndicators: false) {
+                ZStack(alignment: .topLeading) {
+                    ScrollPositionTracker(orientation: orientation, coordinateSpace: scrollCoordinateSpace)
+                    
+                    TimelineBackground(metrics: metrics, zoomScale: zoomScale, orientation: orientation, axisSize: axisSize, visibleSize: visibleSize, scrollPosition: scrollPosition, events: events)
+
+                    ForEach(layouts) { layout in
+                        let isBeingDragged = draggingEventID == layout.id
+                        EventView(event: layout.event)
+                            .frame(width: layout.frame.width, height: layout.frame.height)
+                            .offset(x: layout.frame.minX, y: layout.frame.minY)
+                            .scaleEffect(isBeingDragged ? 1.05 : 1.0)
+                            .opacity(isBeingDragged ? 0.75 : 1.0)
+                            .offset(isBeingDragged ? CGSize(width: dragOffset.dx, height: dragOffset.dy) : .zero)
+                            .zIndex(isBeingDragged ? 1 : 0)
+                            .onTapGesture { eventToEdit = layout.event }
+                            .gesture(dragGesture(for: layout.event))
+                    }
+                }
+                .frame(width: contentSize.width, height: contentSize.height)
+                .id(contentID)
+            }
+            .coordinateSpace(name: scrollCoordinateSpace)
+            .scrollDisabled(draggingEventID != nil)
+            .onPreferenceChange(ScrollOffsetPreferenceKey.self) { self.scrollPosition = $0 }
+            .simultaneousGesture(magnificationGesture(proxy: proxy))
+        }
+    }
+    
+    private func magnificationGesture(proxy: ScrollViewProxy) -> some Gesture {
+        MagnificationGesture()
+            .onChanged { value in
+                guard draggingEventID == nil else { return }
+                
+                let visibleLength = orientation == .vertical ? visibleSize.height : visibleSize.width
+                guard visibleLength > 0 else { return }
+
+                let dateAtCenter = metrics.date(at: -scrollPosition + (visibleLength / 2), for: zoomScale)
+                
+                if initialZoomScale == nil { initialZoomScale = zoomScale }
+                if let initial = initialZoomScale {
+                    zoomScale = max(calculateMinZoom(), min(maxZoomScale, initial * value))
+                }
+                
+                let newPositionForDate = metrics.position(for: dateAtCenter, at: zoomScale)
+                let newScrollOffset = newPositionForDate - (visibleLength / 2)
+                let totalLength = orientation == .vertical ? contentSize.height : contentSize.width
+                
+                if totalLength > 0 {
+                    let anchorPoint = orientation == .vertical ? UnitPoint(x: 0, y: newScrollOffset / totalLength) : UnitPoint(x: newScrollOffset / totalLength, y: 0)
+                    proxy.scrollTo(contentID, anchor: anchorPoint)
+                }
+            }
+            .onEnded { _ in initialZoomScale = nil }
+    }
+    
+    private func dragGesture(for event: Event) -> some Gesture {
+        LongPressGesture(minimumDuration: 0.2)
+            .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .named(scrollCoordinateSpace))
+                .onChanged { value in
+                    if draggingEventID == nil {
+                        draggingEventID = event.id
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    }
+                    dragOffset = CGVector(dx: value.translation.width, dy: value.translation.height)
+                }
+                .onEnded { value in
+                    let dragLength = orientation == .vertical ? value.translation.height : value.translation.width
+                    let timeOffset = dragLength / metrics.pointsPerSecond(at: zoomScale)
+                    let originalDuration = event.duration
+                    
+                    let newStartDate = event.startDate.addingTimeInterval(timeOffset)
+                    event.startDate = newStartDate
+                    
+                    if event.isDuration { event.endDate = newStartDate.addingTimeInterval(originalDuration) }
+                    draggingEventID = nil; dragOffset = .zero
+                }
+            )
+    }
+    
+    private func calculateMinZoom() -> CGFloat {
+        let axisLength = orientation == .vertical ? visibleSize.height : visibleSize.width
+        let totalDuration = metrics.bounds.upperBound.timeIntervalSince(metrics.bounds.lowerBound)
+        guard totalDuration > 0, axisLength > 0 else { return 1.0 }
+        let totalLengthAtScaleOne = metrics.length(for: totalDuration, at: 1.0)
+        return totalLengthAtScaleOne > axisLength ? axisLength / totalLengthAtScaleOne : 1.0
+    }
+
+    private func generateLayouts(containerCrossAxisSize: CGFloat) -> [LayoutEvent] {
+        var layouts: [LayoutEvent] = []
+        var remainingEvents = events.sorted { $0.startDate < $1.startDate }
+
+        while !remainingEvents.isEmpty {
+            var group: [Event] = []
+            var queue: [Event] = [remainingEvents.removeFirst()]
+            group.append(queue.first!)
+
+            while !queue.isEmpty {
+                let current = queue.removeFirst()
+                let currentInterval = current.layoutInterval(using: metrics, zoomScale: zoomScale)
+                
+                let intersecting = remainingEvents.filter {
+                    $0.layoutInterval(using: metrics, zoomScale: zoomScale).intersects(currentInterval)
+                }
+                
+                for event in intersecting {
+                    group.append(event)
+                    queue.append(event)
+                }
+                remainingEvents.removeAll { intersecting.contains($0) }
+            }
+            layouts.append(contentsOf: layoutEventGroup(group, containerCrossAxisSize: containerCrossAxisSize))
+        }
+        return layouts
+    }
+
+    private func layoutEventGroup(_ group: [Event], containerCrossAxisSize: CGFloat) -> [LayoutEvent] {
+        var eventLayouts: [LayoutEvent] = []
+        var laneIntervals: [Int: [DateInterval]] = [:]
+
+        let sortedGroup = group.sorted { $0.startDate < $1.startDate }
+        var eventLanes: [ObjectIdentifier: Int] = [:]
+
+        for event in sortedGroup {
+            let eventInterval = event.layoutInterval(using: metrics, zoomScale: zoomScale)
+            var assignedLane = 0
+            while true {
+                if let intervalsInLane = laneIntervals[assignedLane], intervalsInLane.contains(where: { $0.intersects(eventInterval) }) {
+                    assignedLane += 1
+                } else {
+                    eventLanes[event.id] = assignedLane
+                    laneIntervals[assignedLane, default: []].append(eventInterval)
+                    break
+                }
+            }
+        }
+
+        let totalLanes = (laneIntervals.keys.max() ?? -1) + 1
+        let laneSize = totalLanes > 0 ? containerCrossAxisSize / CGFloat(totalLanes) : containerCrossAxisSize
+
+        for event in group {
+            guard let laneIndex = eventLanes[event.id] else { continue }
+            
+            let startPos = metrics.position(for: event.startDate, at: zoomScale)
+            let length = metrics.length(for: event.duration, at: zoomScale)
+            
+            let frame: CGRect
+            if orientation == .vertical {
+                let x = axisSize + (CGFloat(laneIndex) * laneSize)
+                frame = CGRect(x: x, y: startPos, width: laneSize, height: length)
+            } else {
+                let y = axisSize + (CGFloat(laneIndex) * laneSize)
+                frame = CGRect(x: startPos, y: y, width: length, height: laneSize)
+            }
+            eventLayouts.append(LayoutEvent(event: event, frame: frame))
+        }
+        return eventLayouts
+    }
+}
+
+// MARK: Timeline Primitives & Helpers
 struct ScrollOffsetPreferenceKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
     }
 }
-
+struct ScrollPositionTracker: View {
+    let orientation: TimelineOrientation
+    let coordinateSpace: String
+    var body: some View {
+        GeometryReader { geometry in
+            let offset = orientation == .vertical ? geometry.frame(in: .named(coordinateSpace)).minY : geometry.frame(in: .named(coordinateSpace)).minX
+            Color.clear.preference(key: ScrollOffsetPreferenceKey.self, value: offset)
+        }.frame(height: 0)
+    }
+}
 struct LayoutEvent: Identifiable {
     let event: Event
     var frame: CGRect
     var id: ObjectIdentifier { event.id }
 }
-
-struct TimelineView: View {
-    let events: [Event]
-    @Binding var eventToEdit: Event?
-    let visibleSize: CGSize
-    
-    @State private var zoomScale: CGFloat = 1.0
-    @State private var initialZoomScale: CGFloat? = nil
-    
-    @State private var isDragging: Bool = false
-    @State private var draggingEventID: ObjectIdentifier?
-    @State private var dragOffset: CGSize = .zero
-    @State private var dropIndicatorDate: Date?
-    
-    @State private var scrollPosition: CGFloat = 0
-    
-    private let maxZoomScale: CGFloat = 100.0
-
-    private var timelineBounds: (start: Date, end: Date)? {
-        guard let firstEvent = events.first,
-              let lastEvent = events.max(by: { ($0.endDate ?? $0.startDate) < ($1.endDate ?? $1.startDate) })
-        else { return nil }
-        
-        let firstDate = firstEvent.startDate
-        let lastDate = lastEvent.endDate ?? lastEvent.startDate
-        
-        let totalEventDuration = max(86400 * 30, lastDate.timeIntervalSince(firstDate))
-        let buffer = totalEventDuration * 0.5
-
-        let bufferedStart = firstDate.addingTimeInterval(-buffer)
-        let bufferedEnd = lastDate.addingTimeInterval(buffer)
-
-        return (bufferedStart, bufferedEnd)
-    }
-    
-    private var minZoomScale: CGFloat {
-        guard let bounds = timelineBounds else { return 0.1 }
-        let contentHeightAtScaleOne = TimelineMetrics(bounds: bounds).height(for: bounds.end.timeIntervalSince(bounds.start), at: 1.0)
-        if contentHeightAtScaleOne > visibleSize.height {
-            return visibleSize.height / contentHeightAtScaleOne
-        }
-        return 1.0
-    }
-    
-    var body: some View {
-        if let bounds = timelineBounds {
-            let metrics = TimelineMetrics(bounds: bounds)
-            let totalHeight = metrics.yPosition(for: bounds.end, at: zoomScale) - metrics.yPosition(for: bounds.start, at: zoomScale)
-            
-            let visibleYRange = -scrollPosition ... -scrollPosition + visibleSize.height
-            let visibleDateInterval = DateInterval(
-                start: metrics.date(at: visibleYRange.lowerBound, for: zoomScale),
-                end: metrics.date(at: visibleYRange.upperBound, for: zoomScale)
-            )
-            
-            let screenDuration = visibleDateInterval.duration
-            let bufferedDateInterval = DateInterval(
-                start: visibleDateInterval.start.addingTimeInterval(-screenDuration),
-                end: visibleDateInterval.end.addingTimeInterval(screenDuration)
-            )
-            
-            let virtualizedEvents = events.filter { $0.effectiveInterval.intersects(bufferedDateInterval) }
-            let layouts = generateLayouts(for: virtualizedEvents, metrics: metrics, containerWidth: visibleSize.width, at: zoomScale)
-            
-            ScrollViewReader { proxy in
-                ScrollView {
-                    ZStack(alignment: .topLeading) {
-                        GeometryReader { geometry in
-                            Color.clear.preference(key: ScrollOffsetPreferenceKey.self, value: geometry.frame(in: .named("scroll")).minY)
-                        }
-                        
-                        TimelineBackgroundView(metrics: metrics, zoomScale: zoomScale, visibleDateInterval: visibleDateInterval)
-                        
-                        if let dropDate = dropIndicatorDate, isDragging {
-                            let yPos = metrics.yPosition(for: dropDate, at: zoomScale)
-                            
-                            Path { path in
-                                path.move(to: CGPoint(x: 45, y: yPos))
-                                path.addLine(to: CGPoint(x: 55, y: yPos))
-                            }.stroke(Color.accentColor, lineWidth: 2)
-                            
-                            Text(dropDate.formatted(date: .abbreviated, time: .shortened))
-                                .font(.caption).padding(EdgeInsets(top: 2, leading: 6, bottom: 2, trailing: 6))
-                                .background(Color.accentColor).foregroundColor(Color(.systemBackground)).clipShape(Capsule())
-                                .offset(x: 65, y: yPos - 12).zIndex(2)
-                        }
-                        
-                        ForEach(layouts) { layout in
-                            let isBeingDragged = draggingEventID == layout.event.id
-                            
-                            EventContentView(event: layout.event)
-                                .frame(width: layout.frame.width, height: layout.frame.height)
-                                .offset(x: layout.frame.minX, y: layout.frame.minY)
-                                .scaleEffect(isBeingDragged ? 1.05 : 1.0).opacity(isBeingDragged ? 0.75 : 1.0)
-                                .offset(isBeingDragged ? dragOffset : .zero).zIndex(isBeingDragged ? 1 : 0)
-                                .onTapGesture { if !isDragging { eventToEdit = layout.event } }
-                                .gesture(
-                                    LongPressGesture(minimumDuration: 0.25)
-                                        .onEnded { _ in
-                                            isDragging = true
-                                            draggingEventID = layout.event.id
-                                            let haptics = UIImpactFeedbackGenerator(style: .medium)
-                                            haptics.impactOccurred()
-                                        }
-                                        .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .named("scroll"))
-                                            .onChanged { value in
-                                                if isDragging {
-                                                    dragOffset = value.translation
-                                                    updateDropIndicator(event: layout.event, dragTranslation: value.translation, metrics: metrics, at: zoomScale)
-                                                }
-                                            }
-                                            .onEnded { value in
-                                                guard let eventToMove = events.first(where: { $0.id == draggingEventID }) else {
-                                                    resetDragState(); return
-                                                }
-
-                                                let dateAtCenter = metrics.date(at: -scrollPosition + (visibleSize.height / 2), for: zoomScale)
-                                                let finalDragTranslation = value.translation
-                                                
-                                                resetDragState()
-
-                                                DispatchQueue.main.async {
-                                                    updateEventPosition(event: eventToMove, dragTranslation: finalDragTranslation, metrics: metrics, at: zoomScale)
-                                                    
-                                                    DispatchQueue.main.async {
-                                                        if let newBounds = timelineBounds {
-                                                            let newMetrics = TimelineMetrics(bounds: newBounds)
-                                                            let newY = newMetrics.yPosition(for: dateAtCenter, at: zoomScale)
-                                                            let newScrollOffset = newY - (visibleSize.height / 2)
-                                                            proxy.scrollTo("timeline_content", anchor: UnitPoint(x: 0, y: newScrollOffset / (newMetrics.yPosition(for: newBounds.end, at: zoomScale) - newMetrics.yPosition(for: newBounds.start, at: zoomScale))))
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        )
-                                )
-                        }
-                    }
-                    .frame(width: visibleSize.width, height: totalHeight).id("timeline_content")
-                }
-                .scrollDisabled(isDragging).coordinateSpace(name: "scroll")
-                .onPreferenceChange(ScrollOffsetPreferenceKey.self) { value in self.scrollPosition = value }
-                .simultaneousGesture(
-                    MagnificationGesture()
-                        .onChanged { value in
-                            guard !isDragging else { return }
-                            if initialZoomScale == nil { initialZoomScale = zoomScale }
-                            
-                            let dateAtCenter = metrics.date(at: -scrollPosition + (visibleSize.height / 2), for: zoomScale)
-                            if let initial = initialZoomScale { zoomScale = max(minZoomScale, min(maxZoomScale, initial * value)) }
-                            
-                            let newY = metrics.yPosition(for: dateAtCenter, at: zoomScale)
-                            let newScrollOffset = newY - (visibleSize.height / 2)
-                            proxy.scrollTo("timeline_content", anchor: UnitPoint(x: 0, y: newScrollOffset / totalHeight))
-                        }
-                        .onEnded { _ in initialZoomScale = nil }
-                )
-                .onAppear {
-                    DispatchQueue.main.async {
-                        zoomScale = minZoomScale
-                        let firstEventY = metrics.yPosition(for: bounds.start, at: minZoomScale)
-                        let scrollTargetY = firstEventY - (visibleSize.height * 0.1)
-                        proxy.scrollTo("timeline_content", anchor: UnitPoint(x: 0, y: scrollTargetY / totalHeight))
-                    }
-                }
-            }
-        }
-    }
-    
-    private func resetDragState() { isDragging = false; draggingEventID = nil; dragOffset = .zero; dropIndicatorDate = nil }
-    
-    private func updateEventPosition(event: Event, dragTranslation: CGSize, metrics: TimelineMetrics, at zoomScale: CGFloat) {
-        let eventDuration = event.effectiveInterval.duration
-        let timeOffset = dragTranslation.height / metrics.pointsPerSecond(at: zoomScale)
-        let newStartDate = event.startDate.addingTimeInterval(timeOffset)
-        
-        event.startDate = newStartDate
-        if event.endDate != nil { event.endDate = newStartDate.addingTimeInterval(eventDuration) }
-    }
-    
-    private func updateDropIndicator(event: Event, dragTranslation: CGSize, metrics: TimelineMetrics, at zoomScale: CGFloat) {
-        let timeOffset = dragTranslation.height / metrics.pointsPerSecond(at: zoomScale)
-        dropIndicatorDate = event.startDate.addingTimeInterval(timeOffset)
-    }
-    
-    private func generateLayouts(for events: [Event], metrics: TimelineMetrics, containerWidth: CGFloat, at zoomScale: CGFloat) -> [LayoutEvent] {
-        var eventLanes: [ObjectIdentifier: Int] = [:]; var laneIntervals: [Int: [DateInterval]] = [:]
-        for event in events {
-            let eventInterval = event.effectiveInterval
-            var currentLane = 0
-            while true {
-                if let intervalsInLane = laneIntervals[currentLane],
-                   intervalsInLane.contains(where: { $0.intersects(eventInterval) || $0.end == eventInterval.start }) {
-                    currentLane += 1
-                } else {
-                    eventLanes[event.id] = currentLane; laneIntervals[currentLane, default: []].append(eventInterval); break
-                }
-            }
-        }
-
-        let axisWidth: CGFloat = 60; let totalLanes = (laneIntervals.keys.max() ?? 0) + 1
-        let contentWidth = containerWidth - axisWidth; let laneWidth = totalLanes > 0 ? contentWidth / CGFloat(totalLanes) : contentWidth
-        var layouts: [LayoutEvent] = []
-        for event in events {
-            if let laneIndex = eventLanes[event.id] {
-                let y = metrics.yPosition(for: event.startDate, at: zoomScale)
-                let height = metrics.height(for: event.effectiveInterval.duration, at: zoomScale)
-                let x = axisWidth + (CGFloat(laneIndex) * laneWidth)
-                layouts.append(LayoutEvent(event: event, frame: CGRect(x: x, y: y, width: laneWidth - 5, height: height)))
-            }
-        }
-        return layouts
-    }
-}
-
-
 struct TimelineMetrics {
-    let bounds: (start: Date, end: Date)
-    
-    func pointsPerSecond(at zoomScale: CGFloat) -> CGFloat { (120.0 * zoomScale) / 3600 }
-    func yPosition(for date: Date, at zoomScale: CGFloat) -> CGFloat { (date.timeIntervalSince(bounds.start)) * pointsPerSecond(at: zoomScale) }
-    func date(at yPosition: CGFloat, for zoomScale: CGFloat) -> Date { bounds.start.addingTimeInterval(yPosition / pointsPerSecond(at: zoomScale)) }
-    func height(for duration: TimeInterval, at zoomScale: CGFloat) -> CGFloat { max(duration * pointsPerSecond(at: zoomScale), 44) }
+    let bounds: ClosedRange<Date>
+    func pointsPerSecond(at zoomScale: CGFloat) -> CGFloat {
+        (120.0 * zoomScale) / 3600
+    }
+    func position(for date: Date, at zoomScale: CGFloat) -> CGFloat {
+        date.timeIntervalSince(bounds.lowerBound) * pointsPerSecond(at: zoomScale)
+    }
+    func length(for duration: TimeInterval, at zoomScale: CGFloat) -> CGFloat {
+        max(duration * pointsPerSecond(at: zoomScale), 44)
+    }
+    func date(at position: CGFloat, for zoomScale: CGFloat) -> Date {
+        bounds.lowerBound.addingTimeInterval(position / pointsPerSecond(at: zoomScale))
+    }
+    func dateInterval(for position: CGFloat, length: CGFloat, at zoomScale: CGFloat) -> DateInterval {
+        DateInterval(start: date(at: position, for: zoomScale), end: date(at: position + length, for: zoomScale))
+    }
 }
 
-struct TimelineBackgroundView: View {
-    let metrics: TimelineMetrics
-    let zoomScale: CGFloat
-    let visibleDateInterval: DateInterval
-    
+// MARK: Timeline Subviews
+struct TimelineBackground: View {
+    let metrics: TimelineMetrics, zoomScale: CGFloat, orientation: TimelineOrientation, axisSize: CGFloat, visibleSize: CGSize, scrollPosition: CGFloat, events: [Event]
     var body: some View {
+        let visibleLength = orientation == .vertical ? visibleSize.height : visibleSize.width
+        let visibleInterval = metrics.dateInterval(for: -scrollPosition, length: visibleLength, at: zoomScale)
+        let markers = getMarkers(for: visibleInterval)
+        let visibleEvents = events.filter {
+            let eventEndDate = $0.endDate ?? $0.startDate
+            guard eventEndDate >= $0.startDate else { return false }
+            return DateInterval(start: $0.startDate, end: eventEndDate).intersects(visibleInterval)
+        }
+
         ZStack(alignment: .topLeading) {
-            Path { path in
-                let yStart = metrics.yPosition(for: visibleDateInterval.start, at: zoomScale) - 100
-                let yEnd = metrics.yPosition(for: visibleDateInterval.end, at: zoomScale) + 100
-                path.move(to: CGPoint(x: 50, y: yStart))
-                path.addLine(to: CGPoint(x: 50, y: yEnd))
-            }.stroke(.tertiary, lineWidth: 1)
-            
-            ForEach(getMarkers(), id: \.date) { marker in
-                let yPos = metrics.yPosition(for: marker.date, at: zoomScale)
-                Path { path in
-                    let tickWidth: CGFloat = marker.isMajor ? 10 : 5
-                    path.move(to: CGPoint(x: 50 - tickWidth / 2, y: yPos))
-                    path.addLine(to: CGPoint(x: 50 + tickWidth / 2, y: yPos))
-                }.stroke(.tertiary, lineWidth: marker.isMajor ? 1.5 : 1)
+            Rectangle().fill(.tertiary.opacity(0.5))
+                .frame(width: orientation == .vertical ? 1:nil, height: orientation == .horizontal ? 1:nil)
+                .offset(x: orientation == .vertical ? axisSize-1:0, y: orientation == .horizontal ? axisSize-1:0)
+
+            ForEach(markers, id: \.date) { marker in
+                let pos = metrics.position(for: marker.date, at: zoomScale)
+                let tickSize: CGFloat = marker.isMajor ? 10 : 5
                 
-                Text(marker.label).font(marker.isMajor ? .caption : .caption2).foregroundColor(.secondary)
-                    .frame(width: 40, alignment: .trailing).offset(x: 0, y: yPos - (marker.isMajor ? 8 : 7))
+                if orientation == .vertical {
+                    Path { p in p.move(to: CGPoint(x: axisSize - tickSize, y: pos)); p.addLine(to: CGPoint(x: axisSize, y: pos)) }.stroke(.tertiary, lineWidth: 1)
+                    Text(marker.label).font(.caption).foregroundColor(.secondary).frame(width: axisSize - tickSize - 4, alignment: .trailing).position(x: (axisSize - tickSize - 4) / 2, y: pos)
+                } else {
+                    Path { p in p.move(to: CGPoint(x: pos, y: axisSize - tickSize)); p.addLine(to: CGPoint(x: pos, y: axisSize)) }.stroke(.tertiary, lineWidth: 1)
+                    Text(marker.label).font(.caption).foregroundColor(.secondary).frame(width: 50).position(x: pos, y: (axisSize - tickSize - 12) / 2)
+                }
+            }
+            
+            ForEach(visibleEvents) { event in
+                let startPos = metrics.position(for: event.startDate, at: zoomScale)
+                if event.isDuration, let endDate = event.endDate {
+                    let endPos = metrics.position(for: endDate, at: zoomScale)
+                    Capsule().fill(Color.accentColor.opacity(0.7))
+                        .frame(width: orientation == .vertical ? 4 : endPos-startPos, height: orientation == .vertical ? endPos-startPos : 4)
+                        .offset(x: orientation == .vertical ? axisSize-12 : startPos, y: orientation == .vertical ? startPos : axisSize-12)
+                } else {
+                    Circle().fill(Color.accentColor).frame(width: 6, height: 6)
+                        .position(x: orientation == .vertical ? axisSize-10 : startPos, y: orientation == .vertical ? startPos : axisSize-10)
+                }
             }
         }
     }
-    
-    private func getMarkers() -> [(date: Date, label: String, isMajor: Bool)] {
+    private func getMarkers(for visibleInterval: DateInterval) -> [(date: Date, label: String, isMajor: Bool)] {
+        var markers: [(Date, String, Bool)] = []
         let calendar = Calendar.current
-        var markers = [(date: Date, label: String, isMajor: Bool)]()
-        let minMarkerSpacing: CGFloat = 50.0
-
-        let pointsPerDay = metrics.pointsPerSecond(at: zoomScale) * 86400
-        let pointsPerMonth = pointsPerDay * 30
-        
-        let component: Calendar.Component; let majorMarkerCheck: (Date) -> Bool; let getLabel: (Date, Bool) -> String
-
-        if pointsPerDay > minMarkerSpacing {
-            component = .day; majorMarkerCheck = { date in calendar.component(.day, from: date) == 1 }
-            getLabel = { date, isMajor in isMajor ? date.formatted(.dateTime.month(.abbreviated).day()) : date.formatted(.dateTime.day()) }
-        } else if pointsPerMonth > minMarkerSpacing {
-            component = .month; majorMarkerCheck = { date in calendar.component(.month, from: date) == 1 }
-            getLabel = { date, isMajor in isMajor ? date.formatted(.dateTime.year()) : date.formatted(.dateTime.month(.abbreviated)) }
-        } else {
-            component = .year; majorMarkerCheck = { date in calendar.component(.year, from: date) % 5 == 0 }
-            getLabel = { date, _ in date.formatted(.dateTime.year()) }
-        }
-        
-        guard let firstMarkerDate = calendar.dateInterval(of: component, for: visibleDateInterval.start)?.start else { return [] }
-        var currentDate = firstMarkerDate
-
-        while currentDate <= visibleDateInterval.end {
-            markers.append((currentDate, getLabel(currentDate, majorMarkerCheck(currentDate)), majorMarkerCheck(currentDate)))
-            guard let nextDate = calendar.date(byAdding: component, value: 1, to: currentDate) else { break }
+        let minMarkerSpacing: CGFloat = 70.0
+        let pointsPerDay = metrics.pointsPerSecond(at: zoomScale) * 86400, pointsPerHour = metrics.pointsPerSecond(at: zoomScale) * 3600
+        let component: Calendar.Component, step: Int, format: Date.FormatStyle
+        if pointsPerHour > minMarkerSpacing { component = .hour; step = 1; format = .dateTime.hour() }
+        else if pointsPerDay > minMarkerSpacing*2 { component = .day; step = 1; format = .dateTime.weekday().day() }
+        else if pointsPerDay > minMarkerSpacing { component = .day; step = 2; format = .dateTime.month().day() }
+        else if metrics.length(for: 86400 * 30, at: zoomScale) > minMarkerSpacing { component = .month; step = 1; format = .dateTime.month(.abbreviated) }
+        else { component = .year; step = 1; format = .dateTime.year() }
+        guard let startMarkerDate = calendar.dateInterval(of: component, for: visibleInterval.start)?.start else { return [] }
+        var currentDate = startMarkerDate
+        while currentDate <= visibleInterval.end {
+            markers.append((currentDate, currentDate.formatted(format), false))
+            guard let nextDate = calendar.date(byAdding: component, value: step, to: currentDate) else { break }
             currentDate = nextDate
         }
         return markers
     }
 }
-
-struct EventContentView: View {
+struct EventView: View {
     let event: Event
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(event.title).font(.system(size: 14, weight: .bold)).lineLimit(1)
+            Text(event.title).font(.system(size: 14, weight: .bold)).lineLimit(2)
             Text(dateString()).font(.caption).foregroundColor(.secondary).lineLimit(2)
-            Text(event.details).font(.caption).foregroundColor(.secondary).padding(.top, 1)
+            if !event.details.isEmpty { Text(event.details).font(.caption).foregroundColor(.secondary).padding(.top, 2).lineLimit(4) }
             Spacer(minLength: 0)
-        }
-        .padding(8).background(Color(.secondarySystemBackground)).cornerRadius(8).clipped()
+        }.padding(8).background(.thinMaterial).clipShape(RoundedRectangle(cornerRadius: 8)).overlay(RoundedRectangle(cornerRadius: 8).stroke(.quaternary))
     }
-    
     private func dateString() -> String {
-        let dateFormat = Date.FormatStyle.dateTime.month(.abbreviated).day().year()
-        let timeFormat = Date.FormatStyle.dateTime.hour().minute()
-        if let endDate = event.endDate {
-            let startString: String; let endString: String
-            if event.precision == .time {
-                startString = event.startDate.formatted(dateFormat) + ", " + event.startDate.formatted(timeFormat)
-                if Calendar.current.isDate(event.startDate, inSameDayAs: endDate) { endString = endDate.formatted(timeFormat)
-                } else { endString = endDate.formatted(dateFormat) + ", " + endDate.formatted(timeFormat) }
-            } else { startString = event.startDate.formatted(dateFormat); endString = endDate.formatted(dateFormat) }
-            return startString == endString ? startString : "\(startString) – \(endString)"
-        } else {
-            return event.precision == .time ? "\(event.startDate.formatted(dateFormat)), \(event.startDate.formatted(timeFormat))" : event.startDate.formatted(dateFormat)
-        }
+        let dateFormat = Date.FormatStyle.dateTime.month(.abbreviated).day().year(), timeFormat = Date.FormatStyle.dateTime.hour().minute()
+        let startString = event.precision == .time ? event.startDate.formatted(dateFormat) + ", " + event.startDate.formatted(timeFormat) : event.startDate.formatted(dateFormat)
+        guard let endDate = event.endDate else { return startString }
+        let endString: String
+        if event.precision == .time { let sameDay = Calendar.current.isDate(event.startDate, inSameDayAs: endDate); endString = sameDay ? endDate.formatted(timeFormat) : endDate.formatted(dateFormat) + ", " + endDate.formatted(timeFormat)
+        } else { endString = endDate.formatted(dateFormat) }
+        return startString == endString ? startString : "\(startString) – \(endString)"
     }
 }
 
-// MARK: - Add/Edit Event View
-
-struct AddEventView: View {
-    @Environment(\.modelContext) private var modelContext
+// MARK: - Settings & Editor Views
+struct TimelineSettingsView: View {
+    @Bindable var config: TimelineConfiguration
     @Environment(\.dismiss) var dismiss
-    let event: Event?
-
-    @State private var title: String = ""
-    @State private var details: String = ""
-    @State private var startDate: Date = Date()
-    @State private var endDate: Date = Date().addingTimeInterval(3600)
-    @State private var precision: TimePrecision = .day
-    @State private var isIntervalEvent: Bool = false
     
     var body: some View {
-        NavigationView {
+        NavigationStack {
             Form {
-                Section { TextField("Title", text: $title); Toggle("Interval Event", isOn: $isIntervalEvent) }
-                Section(header: Text(isIntervalEvent ? "Start" : "Date & Time")) {
-                    Picker("Precision", selection: $precision) {
+                Section("Timeline Range") {
+                    DatePicker("Start Date", selection: $config.startDate, displayedComponents: .date)
+                    DatePicker("End Date", selection: $config.endDate, displayedComponents: .date)
+                }
+            }
+            .navigationTitle("Timeline Settings").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") {
+                        config.save()
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+}
+struct EventEditorView: View {
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.dismiss) var dismiss
+    
+    let event: Event?
+    let timelineRange: ClosedRange<Date>
+    
+    @State private var title: String = ""
+    @State private var details: String = ""
+    @State private var startDate: Date = .now
+    @State private var endDate: Date? = nil
+    @State private var precision: TimePrecision = .day
+    @State private var showDeleteConfirmation = false
+    
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section { TextField("Title", text: $title) }
+                
+                Section("Precision") {
+                    Picker("Precision", selection: $precision.animation()) {
                         ForEach(TimePrecision.allCases, id: \.self) { p in Text(p.description).tag(p) }
                     }.pickerStyle(.segmented)
-                    DateTimeRow(title: "Date", date: $startDate, precision: precision)
                 }
-                if isIntervalEvent {
-                    Section(header: Text("End")) { DateTimeRow(title: "Date", date: $endDate, precision: precision) }
+                
+                Section("Start") {
+                    DatePicker("Date", selection: $startDate, in: timelineRange, displayedComponents: precision == .time ? [.date, .hourAndMinute] : [.date])
                 }
-                Section(header: Text("Description")) { TextEditor(text: $details).frame(minHeight: 150) }
+                
+                Section("End") {
+                    if let binding = Binding($endDate) {
+                        DatePicker("Date", selection: binding, in: startDate..., displayedComponents: precision == .time ? [.date, .hourAndMinute] : [.date])
+                        Button("Remove End Date", role: .destructive) { endDate = nil }
+                    } else {
+                        Button("Add End Date") { endDate = startDate.addingTimeInterval(3600) }
+                    }
+                }
+                
+                Section("Description") {
+                    TextEditor(text: $details).frame(minHeight: 120)
+                }
+                
+                if event != nil {
+                    Section {
+                        Button("Delete Event", role: .destructive) { showDeleteConfirmation = true }
+                    }
+                }
             }
-            .navigationTitle(event == nil ? "New Event" : "Edit Event").navigationBarTitleDisplayMode(.inline)
+            .navigationTitle(event == nil ? "New Event" : "Edit Event")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) { Button("Cancel") { dismiss() } }
-                ToolbarItem(placement: .navigationBarTrailing) { Button("Save") { save(); dismiss() }.disabled(title.isEmpty) }
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) { Button("Save", action: save).disabled(title.isEmpty) }
             }
             .onAppear(perform: setupInitialState)
-            .onChange(of: isIntervalEvent) { if !$1 { endDate = startDate.addingTimeInterval(3600) } }
-            .onChange(of: startDate) { if endDate < $1 { endDate = $1.addingTimeInterval(3600) } }
+            .onChange(of: precision) { _, newPrecision in
+                if newPrecision == .day {
+                    self.startDate = Calendar.current.startOfDay(for: startDate)
+                    if let currentEndDate = self.endDate {
+                        self.endDate = Calendar.current.startOfDay(for: currentEndDate)
+                    }
+                }
+            }
+            .alert("Delete Event?", isPresented: $showDeleteConfirmation) {
+                Button("Delete", role: .destructive, action: deleteEvent)
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This action cannot be undone.")
+            }
         }
     }
     
     private func setupInitialState() {
         if let event {
-            title = event.title; details = event.details; startDate = event.startDate; precision = event.precision
-            if let eventEndDate = event.endDate { isIntervalEvent = true; endDate = eventEndDate } else { isIntervalEvent = false }
+            title = event.title
+            details = event.details
+            startDate = event.startDate
+            endDate = event.endDate
+            precision = event.precision
+        } else {
+            startDate = Calendar.current.date(byAdding: .day, value: 1, to: timelineRange.lowerBound) ?? .now
         }
     }
     
     private func save() {
-        var finalStartDate = startDate; var finalEndDate: Date? = isIntervalEvent ? endDate : nil
-        if precision == .day {
-            finalStartDate = Calendar.current.startOfDay(for: startDate)
-            if let unwrappedEndDate = finalEndDate { finalEndDate = Calendar.current.startOfDay(for: unwrappedEndDate) }
-        }
-        
         if let event {
-            event.title = title; details = details; event.startDate = finalStartDate; event.endDate = finalEndDate; event.precision = precision
+            event.title = title
+            event.details = details
+            event.startDate = startDate
+            event.endDate = endDate
+            event.precision = precision
         } else {
-            modelContext.insert(Event(startDate: finalStartDate, endDate: finalEndDate, title: title, details: details, precision: precision))
+            let newEvent = Event(startDate: startDate, endDate: endDate, title: title, details: details, precision: precision)
+            modelContext.insert(newEvent)
         }
+        dismiss()
     }
-}
-
-struct DateTimeRow: View {
-    let title: String; @Binding var date: Date; let precision: TimePrecision
-    var body: some View {
-        HStack {
-            Text(title).frame(width: 50, alignment: .leading)
-            DatePicker(title, selection: $date, displayedComponents: .date).labelsHidden()
-            if precision == .time { DatePicker(title, selection: $date, displayedComponents: [.hourAndMinute]).labelsHidden() }
+    
+    private func deleteEvent() {
+        if let event {
+            modelContext.delete(event)
         }
+        dismiss()
     }
 }
