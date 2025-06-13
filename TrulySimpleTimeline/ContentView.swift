@@ -282,7 +282,7 @@ struct TimelineScrollView: View {
     
     private var layouts: [LayoutEvent] {
         let crossAxisSize = orientation == .vertical ? visibleSize.width - axisSize : visibleSize.height - axisSize
-        return generateLayouts(containerCrossAxisSize: crossAxisSize)
+        return generateLayouts(containerCrossAxisSize: crossAxisSize, draggedEventID: dragState?.event.id)
     }
     
     private var contentSize: CGSize {
@@ -427,7 +427,7 @@ struct TimelineScrollView: View {
         return metrics.calculateMinZoom(for: axisLength)
     }
 
-    private func generateLayouts(containerCrossAxisSize: CGFloat) -> [LayoutEvent] {
+    private func generateLayouts(containerCrossAxisSize: CGFloat, draggedEventID: ObjectIdentifier?) -> [LayoutEvent] {
         var layouts: [LayoutEvent] = []
         var remainingEvents = events.sorted { $0.startDate < $1.startDate }
 
@@ -450,19 +450,26 @@ struct TimelineScrollView: View {
                 }
                 remainingEvents.removeAll { intersecting.contains($0) }
             }
-            layouts.append(contentsOf: layoutEventGroup(group, containerCrossAxisSize: containerCrossAxisSize))
+            layouts.append(contentsOf: layoutEventGroup(group, containerCrossAxisSize: containerCrossAxisSize, draggedEventID: draggedEventID))
         }
         return layouts
     }
 
-    private func layoutEventGroup(_ group: [Event], containerCrossAxisSize: CGFloat) -> [LayoutEvent] {
+    private func layoutEventGroup(_ group: [Event], containerCrossAxisSize: CGFloat, draggedEventID: ObjectIdentifier?) -> [LayoutEvent] {
         var eventLayouts: [LayoutEvent] = []
         var laneIntervals: [Int: [DateInterval]] = [:]
-
-        let sortedGroup = group.sorted { $0.startDate < $1.startDate }
         var eventLanes: [ObjectIdentifier: Int] = [:]
+        var eventsToProcess = group.sorted { $0.startDate < $1.startDate }
 
-        for event in sortedGroup {
+        if let draggedEventID = draggedEventID, let draggedEventIndex = eventsToProcess.firstIndex(where: { $0.id == draggedEventID }) {
+            let draggedEvent = eventsToProcess.remove(at: draggedEventIndex)
+            let eventInterval = draggedEvent.layoutInterval(using: metrics, zoomScale: zoomScale, orientation: orientation)
+            
+            eventLanes[draggedEvent.id] = 0
+            laneIntervals[0, default: []].append(eventInterval)
+        }
+
+        for event in eventsToProcess {
             let eventInterval = event.layoutInterval(using: metrics, zoomScale: zoomScale, orientation: orientation)
             var assignedLane = 0
             while true {
