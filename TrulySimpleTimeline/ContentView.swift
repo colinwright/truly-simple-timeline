@@ -265,10 +265,14 @@ struct TimelineScrollView: View {
     let isDragEnabled: Bool
     let onEventMoved: (Event, Date) -> Void
 
+    private struct DragState {
+        let event: Event
+        let originalStartDate: Date
+    }
+    
+    @State private var dragState: DragState?
     @State private var scrollPosition: CGFloat = 0
     @State private var initialZoomScale: CGFloat?
-    @State private var draggingEventID: ObjectIdentifier?
-    @State private var dragOffset: CGVector = .zero
     @State private var scrollUpdateTask: Task<Void, Never>?
     
     private let axisSize: CGFloat = 60
@@ -295,13 +299,12 @@ struct TimelineScrollView: View {
                     ScrollPositionTracker(orientation: orientation, scrollPosition: $scrollPosition, coordinateSpace: scrollCoordinateSpace)
                     TimelineBackground(metrics: metrics, zoomScale: zoomScale, orientation: orientation, axisSize: axisSize, visibleSize: visibleSize, scrollPosition: $scrollPosition, events: events)
                     ForEach(layouts) { layout in
-                        let isBeingDragged = draggingEventID == layout.id
+                        let isBeingDragged = dragState?.event.id == layout.id
                         EventView(event: layout.event, orientation: orientation)
                             .frame(width: layout.frame.width, height: layout.frame.height)
                             .offset(x: layout.frame.minX, y: layout.frame.minY)
                             .scaleEffect(isBeingDragged ? 1.05 : 1.0)
                             .opacity(isBeingDragged ? 0.75 : 1.0)
-                            .offset(isBeingDragged ? CGSize(width: dragOffset.dx, height: dragOffset.dy) : .zero)
                             .zIndex(isBeingDragged ? 1 : 0)
                             .onTapGesture { eventToEdit = layout.event }
                             .if(isDragEnabled) { view in
@@ -313,7 +316,7 @@ struct TimelineScrollView: View {
                 .id(contentID)
             }
             .coordinateSpace(name: scrollCoordinateSpace)
-            .scrollDisabled(draggingEventID != nil)
+            .scrollDisabled(dragState != nil)
             .simultaneousGesture(magnificationGesture(proxy: proxy))
             .onAppear { scrollTo(date: centerDate, proxy: proxy, animated: false) }
             .onChange(of: visibleSize) { _, _ in scrollTo(date: centerDate, proxy: proxy, animated: false) }
@@ -362,7 +365,7 @@ struct TimelineScrollView: View {
     private func magnificationGesture(proxy: ScrollViewProxy) -> some Gesture {
         MagnificationGesture()
             .onChanged { value in
-                guard draggingEventID == nil else { return }
+                guard dragState == nil else { return }
                 
                 let visibleLength = orientation == .vertical ? visibleSize.height : visibleSize.width
                 guard visibleLength > 0 else { return }
@@ -393,26 +396,28 @@ struct TimelineScrollView: View {
         LongPressGesture(minimumDuration: 0.2)
             .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .named(scrollCoordinateSpace))
                 .onChanged { value in
-                    if draggingEventID == nil {
-                        draggingEventID = event.id
+                    if dragState == nil {
+                        dragState = DragState(event: event, originalStartDate: event.startDate)
                         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                     }
-                    dragOffset = CGVector(dx: value.translation.width, dy: value.translation.height)
-                }
-                .onEnded { value in
-                    let oldStartDate = event.startDate
+                    
+                    guard let currentDrag = dragState else { return }
+                    
                     let dragLength = orientation == .vertical ? value.translation.height : value.translation.width
                     let timeOffset = dragLength / metrics.pointsPerSecond(at: zoomScale)
-                    let originalDuration = event.duration
+                    let originalDuration = currentDrag.event.duration
                     
-                    let newStartDate = event.startDate.addingTimeInterval(timeOffset)
-                    event.startDate = newStartDate
+                    let newStartDate = currentDrag.originalStartDate.addingTimeInterval(timeOffset)
+                    currentDrag.event.startDate = newStartDate
                     
-                    if event.isDuration { event.endDate = newStartDate.addingTimeInterval(originalDuration) }
-                    
-                    onEventMoved(event, oldStartDate)
-                    
-                    draggingEventID = nil; dragOffset = .zero
+                    if currentDrag.event.isDuration {
+                        currentDrag.event.endDate = newStartDate.addingTimeInterval(originalDuration)
+                    }
+                }
+                .onEnded { value in
+                    guard let endedDrag = dragState else { return }
+                    onEventMoved(endedDrag.event, endedDrag.originalStartDate)
+                    dragState = nil
                 }
             )
     }
