@@ -68,8 +68,9 @@ final class Event {
         return duration
     }
     
-    func layoutInterval(using metrics: TimelineMetrics, zoomScale: CGFloat) -> DateInterval {
-        let minLengthInSeconds = (44 / metrics.pointsPerSecond(at: zoomScale))
+    func layoutInterval(using metrics: TimelineMetrics, zoomScale: CGFloat, orientation: TimelineOrientation) -> DateInterval {
+        let minPoints = orientation == .horizontal ? 180.0 : 44.0
+        let minLengthInSeconds = (minPoints / metrics.pointsPerSecond(at: zoomScale))
         let durationForLayout = max(self.effectiveDuration, minLengthInSeconds)
         return DateInterval(start: self.startDate, duration: durationForLayout)
     }
@@ -153,12 +154,13 @@ struct ContentView: View {
                 .navigationTitle("Timeline")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
-                    ToolbarItemGroup(placement: .navigationBarTrailing) {
+                    ToolbarItemGroup(placement: .navigationBarLeading) {
                         Button("Undo", systemImage: "arrow.uturn.backward") { undoLastMove() }
                             .disabled(undoState == nil)
                         
                         Button { isDragEnabled.toggle() } label: { Image(systemName: isDragEnabled ? "lock.open" : "lock") }
-                        
+                    }
+                    ToolbarItemGroup(placement: .navigationBarTrailing) {
                         Button { showEventEditor = true } label: { Image(systemName: "plus") }
                         
                         Button { showSettings = true } label: { Image(systemName: "gearshape") }
@@ -294,7 +296,7 @@ struct TimelineScrollView: View {
                     TimelineBackground(metrics: metrics, zoomScale: zoomScale, orientation: orientation, axisSize: axisSize, visibleSize: visibleSize, scrollPosition: $scrollPosition, events: events)
                     ForEach(layouts) { layout in
                         let isBeingDragged = draggingEventID == layout.id
-                        EventView(event: layout.event)
+                        EventView(event: layout.event, orientation: orientation)
                             .frame(width: layout.frame.width, height: layout.frame.height)
                             .offset(x: layout.frame.minX, y: layout.frame.minY)
                             .scaleEffect(isBeingDragged ? 1.05 : 1.0)
@@ -431,10 +433,10 @@ struct TimelineScrollView: View {
 
             while !queue.isEmpty {
                 let current = queue.removeFirst()
-                let currentInterval = current.layoutInterval(using: metrics, zoomScale: zoomScale)
+                let currentInterval = current.layoutInterval(using: metrics, zoomScale: zoomScale, orientation: orientation)
                 
                 let intersecting = remainingEvents.filter {
-                    $0.layoutInterval(using: metrics, zoomScale: zoomScale).intersects(currentInterval)
+                    $0.layoutInterval(using: metrics, zoomScale: zoomScale, orientation: orientation).intersects(currentInterval)
                 }
                 
                 for event in intersecting {
@@ -456,7 +458,7 @@ struct TimelineScrollView: View {
         var eventLanes: [ObjectIdentifier: Int] = [:]
 
         for event in sortedGroup {
-            let eventInterval = event.layoutInterval(using: metrics, zoomScale: zoomScale)
+            let eventInterval = event.layoutInterval(using: metrics, zoomScale: zoomScale, orientation: orientation)
             var assignedLane = 0
             while true {
                 if let intervalsInLane = laneIntervals[assignedLane], intervalsInLane.contains(where: { $0.intersects(eventInterval) }) {
@@ -476,15 +478,17 @@ struct TimelineScrollView: View {
             guard let laneIndex = eventLanes[event.id] else { continue }
             
             let startPos = metrics.position(for: event.startDate, at: zoomScale)
-            let length = metrics.length(for: event.effectiveDuration, at: zoomScale)
+            
+            let minPoints = orientation == .horizontal ? 180.0 : 44.0
+            let mainAxisLength = max(metrics.pureLength(for: event.effectiveDuration, at: zoomScale), minPoints)
             
             let frame: CGRect
             if orientation == .vertical {
                 let x = axisSize + (CGFloat(laneIndex) * laneSize)
-                frame = CGRect(x: x, y: startPos, width: laneSize, height: length)
+                frame = CGRect(x: x, y: startPos, width: laneSize, height: mainAxisLength)
             } else {
                 let y = axisSize + (CGFloat(laneIndex) * laneSize)
-                frame = CGRect(x: startPos, y: y, width: length, height: laneSize)
+                frame = CGRect(x: startPos, y: y, width: mainAxisLength, height: laneSize)
             }
             eventLayouts.append(LayoutEvent(event: event, frame: frame))
         }
@@ -648,27 +652,14 @@ struct TimelineBackground: View {
 }
 struct EventView: View {
     let event: Event
+    let orientation: TimelineOrientation
+    
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(event.title).font(.system(size: 14, weight: .bold)).lineLimit(2)
-            Text(dateString()).font(.caption).foregroundColor(.secondary).lineLimit(2)
-            if !event.details.isEmpty { Text(event.details).font(.caption).foregroundColor(.secondary).padding(.top, 2).lineLimit(4) }
-            
-            Spacer(minLength: 0)
-            
-            if let characters = event.characters, !characters.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack {
-                        ForEach(characters.sorted(by: { $0.name < $1.name })) { character in
-                            Text(character.name)
-                                .font(.caption2)
-                                .padding(.horizontal, 6).padding(.vertical, 3)
-                                .background(Color.secondary.opacity(0.2))
-                                .clipShape(Capsule())
-                        }
-                    }
-                }
-                .padding(.top, 4)
+        Group {
+            if orientation == .vertical {
+                verticalBody
+            } else {
+                horizontalBody
             }
         }
         .padding(8)
@@ -677,6 +668,66 @@ struct EventView: View {
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(.quaternary))
     }
+    
+    private var verticalBody: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(event.title).font(.system(size: 14, weight: .bold)).lineLimit(2)
+            Text(dateString()).font(.caption).foregroundColor(.secondary).lineLimit(2)
+            if !event.details.isEmpty {
+                Text(event.details).font(.caption).foregroundColor(.secondary).padding(.top, 2).lineLimit(4)
+            }
+            
+            Spacer(minLength: 0)
+            
+            characterList
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+    
+    private var horizontalBody: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(event.title)
+                .font(.system(size: 14, weight: .bold))
+                .lineLimit(1)
+            
+            Text(dateString())
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .lineLimit(2)
+            
+            if !event.details.isEmpty {
+                Text(event.details)
+                    .font(.caption)
+                    .foregroundColor(.secondary.opacity(0.8))
+                    .padding(.top, 2)
+                    .lineLimit(3)
+            }
+            
+            Spacer(minLength: 4)
+            
+            characterList
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+    
+    @ViewBuilder
+    private var characterList: some View {
+        if let characters = event.characters, !characters.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack {
+                    ForEach(characters.sorted(by: { $0.name < $1.name })) { character in
+                        Text(character.name)
+                            .font(.caption2)
+                            .padding(.horizontal, 6).padding(.vertical, 3)
+                            .background(Color.secondary.opacity(0.2))
+                            .clipShape(Capsule())
+                    }
+                }
+            }
+            .padding(.top, 4)
+        }
+    }
+    
     private func dateString() -> String {
         let dateFormat = Date.FormatStyle.dateTime.month(.abbreviated).day().year(), timeFormat = Date.FormatStyle.dateTime.hour().minute()
         let startString = event.precision == .time ? event.startDate.formatted(dateFormat) + ", " + event.startDate.formatted(timeFormat) : event.startDate.formatted(dateFormat)
@@ -785,7 +836,6 @@ struct EventEditorView: View {
                 }
                 
                 Section("Characters") {
-                    // This could be a flow layout, but a simple list works for now
                     ForEach(Array(selectedCharacters).sorted(by: { $0.name < $1.name })) { char in
                         HStack {
                             Text(char.name)
