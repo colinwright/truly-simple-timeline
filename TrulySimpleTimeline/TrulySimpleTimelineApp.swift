@@ -7,7 +7,6 @@ struct TrulySimpleTimelineApp: App {
         WindowGroup {
             ContentView()
         }
-        // This line creates the database and prepares it for our Event model.
-        .modelContainer(for: Event.self)
+        .modelContainer(for: [Event.self, Character.self])
     }
 }
