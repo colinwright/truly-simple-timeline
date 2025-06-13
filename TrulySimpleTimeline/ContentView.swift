@@ -144,11 +144,6 @@ extension TimelineConfiguration {
 
 // MARK: - Timeline View & Components
 
-struct InitialViewport: Equatable {
-    var zoom: CGFloat
-    var targetDate: Date
-}
-
 struct TimelineView: View {
     let events: [Event]
     let config: TimelineConfiguration
@@ -156,7 +151,8 @@ struct TimelineView: View {
     let visibleSize: CGSize
     @Binding var eventToEdit: Event?
     
-    @State private var initialViewport: InitialViewport?
+    @State private var zoomScale: CGFloat = 1.0
+    @State private var centerDate: Date?
 
     private var metrics: TimelineMetrics { TimelineMetrics(config: config) }
 
@@ -164,54 +160,29 @@ struct TimelineView: View {
         Group {
             if events.isEmpty {
                 ContentUnavailableView("No Events Yet", systemImage: "note.text.badge.plus", description: Text("Tap the + button to add your first event."))
-            } else {
+            } else if let centerDateBinding = Binding($centerDate) {
                 TimelineScrollView(
                     events: events,
                     metrics: metrics,
                     orientation: orientation,
                     visibleSize: visibleSize,
-                    initialViewport: $initialViewport,
+                    zoomScale: $zoomScale,
+                    centerDate: centerDateBinding,
                     eventToEdit: $eventToEdit
                 )
+            } else {
+                Color.clear
             }
         }
-        .onAppear { calculateInitialViewport() }
-        .onChange(of: orientation) { calculateInitialViewport() }
-    }
-    
-    private func calculateInitialViewport() {
-        let axisLength = orientation == .vertical ? visibleSize.height : visibleSize.width
-        guard axisLength > 0 else { return }
-        
-        var targetZoom: CGFloat
-        var targetDate: Date
-        
-        if events.isEmpty {
-            targetZoom = calculateMinZoom()
-            targetDate = config.startDate
-        } else {
-            let firstEventDate = events.first!.startDate
-            let lastEvent = events.max { a, b in (a.endDate ?? a.startDate) < (b.endDate ?? b.startDate) }!
-            let lastEventDate = lastEvent.endDate ?? lastEvent.startDate
+        .onChange(of: visibleSize) { _, newSize in
+            guard centerDate == nil, newSize.width > 0, newSize.height > 0 else { return }
             
-            var contentSpan = lastEventDate.timeIntervalSince(firstEventDate)
-            if contentSpan < 3600 { contentSpan = 86400 * 7 }
-            
-            let paddedSpan = contentSpan * 1.2
-            let targetPointsPerSecond = axisLength / paddedSpan
-            targetZoom = (targetPointsPerSecond * 3600) / 120.0
-            targetDate = firstEventDate
-        }
-        
-        initialViewport = InitialViewport(zoom: targetZoom, targetDate: targetDate)
-    }
+            let axisLength = orientation == .vertical ? newSize.height : newSize.width
+            zoomScale = metrics.calculateMinZoom(for: axisLength)
 
-    private func calculateMinZoom() -> CGFloat {
-        let axisLength = orientation == .vertical ? visibleSize.height : visibleSize.width
-        let totalDuration = config.dateRange.upperBound.timeIntervalSince(config.dateRange.lowerBound)
-        guard totalDuration > 0, axisLength > 0 else { return 1.0 }
-        let totalLengthAtScaleOne = metrics.length(for: totalDuration, at: 1.0)
-        return totalLengthAtScaleOne > axisLength ? axisLength / totalLengthAtScaleOne : 1.0
+            let totalDuration = config.endDate.timeIntervalSince(config.startDate)
+            centerDate = config.startDate.addingTimeInterval(totalDuration / 2.0)
+        }
     }
 }
 
@@ -221,14 +192,15 @@ struct TimelineScrollView: View {
     let orientation: TimelineOrientation
     let visibleSize: CGSize
     
-    @Binding var initialViewport: InitialViewport?
+    @Binding var zoomScale: CGFloat
+    @Binding var centerDate: Date
     @Binding var eventToEdit: Event?
 
-    @State private var zoomScale: CGFloat = 1.0
     @State private var scrollPosition: CGFloat = 0
     @State private var initialZoomScale: CGFloat?
     @State private var draggingEventID: ObjectIdentifier?
     @State private var dragOffset: CGVector = .zero
+    @State private var scrollUpdateTask: Task<Void, Never>?
     
     private let axisSize: CGFloat = 60
     private let maxZoomScale: CGFloat = 200.0
@@ -241,7 +213,7 @@ struct TimelineScrollView: View {
     }
     
     private var contentSize: CGSize {
-        let totalLength = metrics.length(for: metrics.config.dateRange.upperBound.timeIntervalSince(metrics.config.dateRange.lowerBound), at: zoomScale)
+        let totalLength = metrics.pureLength(for: metrics.config.dateRange.upperBound.timeIntervalSince(metrics.config.dateRange.lowerBound), at: zoomScale)
         return orientation == .vertical
             ? CGSize(width: visibleSize.width, height: totalLength)
             : CGSize(width: totalLength, height: visibleSize.height)
@@ -272,28 +244,49 @@ struct TimelineScrollView: View {
             .coordinateSpace(name: scrollCoordinateSpace)
             .scrollDisabled(draggingEventID != nil)
             .simultaneousGesture(magnificationGesture(proxy: proxy))
-            .onChange(of: initialViewport) { _, newViewport in
-                setViewport(to: newViewport, proxy: proxy)
+            .onAppear { scrollTo(date: centerDate, proxy: proxy, animated: false) }
+            .onChange(of: visibleSize) { _, _ in scrollTo(date: centerDate, proxy: proxy, animated: false) }
+            .onChange(of: scrollPosition) { _, newPosition in
+                updateCenterDateFromScroll(position: newPosition)
             }
         }
     }
     
-    private func setViewport(to viewport: InitialViewport?, proxy: ScrollViewProxy) {
-        guard let viewport else { return }
+    private func scrollTo(date: Date, proxy: ScrollViewProxy, animated: Bool) {
+        let axisLength = orientation == .vertical ? visibleSize.height : visibleSize.width
+        guard axisLength > 0 else { return }
+
+        let targetPosition = metrics.position(for: date, at: zoomScale)
+        let scrollOffset = targetPosition - (axisLength / 2)
         
-        self.zoomScale = max(calculateMinZoom(), viewport.zoom)
+        let totalLength = orientation == .vertical ? contentSize.height : contentSize.width
+        guard totalLength > 0 else { return }
+
+        let anchor = orientation == .vertical
+            ? UnitPoint(x: 0, y: scrollOffset / totalLength)
+            : UnitPoint(x: scrollOffset / totalLength, y: 0)
         
-        DispatchQueue.main.async {
-            let axisLength = orientation == .vertical ? visibleSize.height : visibleSize.width
-            let firstEventPosition = metrics.position(for: viewport.targetDate, at: self.zoomScale)
-            let scrollMargin = axisLength * 0.1
-            let scrollTargetPosition = firstEventPosition - scrollMargin
-            let totalLength = contentSize.width > 0 && contentSize.height > 0 ? (orientation == .vertical ? contentSize.height : contentSize.width) : 1
-            
-            let anchorPoint = orientation == .vertical ?
-                UnitPoint(x: 0, y: scrollTargetPosition / totalLength) :
-                UnitPoint(x: scrollTargetPosition / totalLength, y: 0)
-            proxy.scrollTo(contentID, anchor: anchorPoint)
+        if animated {
+            withAnimation { proxy.scrollTo(contentID, anchor: anchor) }
+        } else {
+            proxy.scrollTo(contentID, anchor: anchor)
+        }
+    }
+    
+    private func updateCenterDateFromScroll(position: CGFloat) {
+        scrollUpdateTask?.cancel()
+        scrollUpdateTask = Task {
+            do {
+                try await Task.sleep(for: .milliseconds(50))
+                let axisLength = orientation == .vertical ? visibleSize.height : visibleSize.width
+                let newCenterDate = metrics.date(at: -position + (axisLength / 2), for: zoomScale)
+                
+                await MainActor.run {
+                    self.centerDate = newCenterDate
+                }
+            } catch {
+                // Task was cancelled.
+            }
         }
     }
     
@@ -321,7 +314,10 @@ struct TimelineScrollView: View {
                     proxy.scrollTo(contentID, anchor: anchorPoint)
                 }
             }
-            .onEnded { _ in initialZoomScale = nil }
+            .onEnded { _ in
+                initialZoomScale = nil
+                updateCenterDateFromScroll(position: scrollPosition)
+            }
     }
     
     private func dragGesture(for event: Event) -> some Gesture {
@@ -350,10 +346,7 @@ struct TimelineScrollView: View {
 
     private func calculateMinZoom() -> CGFloat {
         let axisLength = orientation == .vertical ? visibleSize.height : visibleSize.width
-        let totalDuration = metrics.config.dateRange.upperBound.timeIntervalSince(metrics.config.dateRange.lowerBound)
-        guard totalDuration > 0, axisLength > 0 else { return 1.0 }
-        let totalLengthAtScaleOne = metrics.length(for: totalDuration, at: 1.0)
-        return totalLengthAtScaleOne > axisLength ? axisLength / totalLengthAtScaleOne : 1.0
+        return metrics.calculateMinZoom(for: axisLength)
     }
 
     private func generateLayouts(containerCrossAxisSize: CGFloat) -> [LayoutEvent] {
@@ -460,9 +453,19 @@ struct TimelineMetrics {
     
     func pointsPerSecond(at zoomScale: CGFloat) -> CGFloat { (120.0 * zoomScale) / 3600 }
     func position(for date: Date, at zoomScale: CGFloat) -> CGFloat { date.timeIntervalSince(bounds.lowerBound) * pointsPerSecond(at: zoomScale) }
-    func length(for duration: TimeInterval, at zoomScale: CGFloat) -> CGFloat { max(duration * pointsPerSecond(at: zoomScale), 44) }
+    func pureLength(for duration: TimeInterval, at zoomScale: CGFloat) -> CGFloat { duration * pointsPerSecond(at: zoomScale) }
+    func length(for duration: TimeInterval, at zoomScale: CGFloat) -> CGFloat { max(pureLength(for: duration, at: zoomScale), 44) }
     func date(at position: CGFloat, for zoomScale: CGFloat) -> Date { bounds.lowerBound.addingTimeInterval(position / pointsPerSecond(at: zoomScale)) }
     func dateInterval(for position: CGFloat, length: CGFloat, at zoomScale: CGFloat) -> DateInterval { DateInterval(start: date(at: position, for: zoomScale), end: date(at: position + length, for: zoomScale)) }
+    
+    func calculateMinZoom(for axisLength: CGFloat) -> CGFloat {
+        let totalDuration = config.dateRange.upperBound.timeIntervalSince(config.dateRange.lowerBound)
+        guard totalDuration > 0, axisLength > 0 else { return 1.0 }
+        
+        let totalLengthAtScaleOne = pureLength(for: totalDuration, at: 1.0)
+        
+        return totalLengthAtScaleOne > axisLength ? axisLength / totalLengthAtScaleOne : 1.0
+    }
 }
 
 struct RenderableRegion {
@@ -513,6 +516,7 @@ struct TimelineBackground: View {
                 }
             }
         }
+        .onAppear { updateRenderableRegion() }
         .onChange(of: scrollPosition) { _, _ in updateRenderableRegion(debounced: true) }
         .onChange(of: zoomScale) { _, _ in updateRenderableRegion() }
         .onChange(of: visibleSize) { _, _ in updateRenderableRegion() }
