@@ -122,6 +122,7 @@ class DisplaySettings {
     private let showDetailsKey = "displayShowDetails"
     private let showPeopleKey = "displayShowPeople"
     private let showLocationsKey = "displayShowLocations"
+    private let showDurationKey = "displayShowDuration"
     private let isDragEnabledKey = "displayIsDragEnabled"
     private let isTapToAddEnabledKey = "displayIsTapToAddEnabled"
     
@@ -129,6 +130,7 @@ class DisplaySettings {
     var showDetails: Bool
     var showPeople: Bool
     var showLocations: Bool
+    var showDuration: Bool
     var isDragEnabled: Bool
     var isTapToAddEnabled: Bool
 
@@ -138,6 +140,7 @@ class DisplaySettings {
         self.showDetails = defaults.object(forKey: showDetailsKey) as? Bool ?? true
         self.showPeople = defaults.object(forKey: showPeopleKey) as? Bool ?? true
         self.showLocations = defaults.object(forKey: showLocationsKey) as? Bool ?? true
+        self.showDuration = defaults.object(forKey: showDurationKey) as? Bool ?? true
         self.isDragEnabled = defaults.object(forKey: isDragEnabledKey) as? Bool ?? true
         self.isTapToAddEnabled = defaults.object(forKey: isTapToAddEnabledKey) as? Bool ?? true
     }
@@ -148,6 +151,7 @@ class DisplaySettings {
         defaults.set(showDetails, forKey: showDetailsKey)
         defaults.set(showPeople, forKey: showPeopleKey)
         defaults.set(showLocations, forKey: showLocationsKey)
+        defaults.set(showDuration, forKey: showDurationKey)
         defaults.set(isDragEnabled, forKey: isDragEnabledKey)
         defaults.set(isTapToAddEnabled, forKey: isTapToAddEnabledKey)
     }
@@ -717,7 +721,6 @@ struct TimelineScrollView: View {
         let arcEvents = events.filter { $0.isArcEvent }
         let regularEvents = events.filter { !$0.isArcEvent }
 
-        // 1. Layout Arc Events
         let hasArcLane = !arcEvents.isEmpty
         let arcLaneSize: CGFloat = 10.0
         for event in arcEvents {
@@ -732,7 +735,6 @@ struct TimelineScrollView: View {
             layouts.append(LayoutEvent(event: event, frame: frame))
         }
 
-        // 2. Layout Regular Events
         let regularContainerSize = containerCrossAxisSize - (hasArcLane ? arcLaneSize : 0)
         let regularContainerOffset = axisSize + (hasArcLane ? arcLaneSize : 0)
         
@@ -1008,6 +1010,9 @@ struct EventView: View {
         VStack(alignment: .leading, spacing: 2) {
             if displaySettings.showTitle { Text(event.title).font(.system(size: 14, weight: .bold)).lineLimit(2) }
             Text(dateString()).font(.caption).foregroundColor(.secondary).lineLimit(2)
+            if displaySettings.showDuration, let durationText = formattedDuration() {
+                Label(durationText, systemImage: "hourglass").font(.caption).foregroundColor(.secondary)
+            }
             if displaySettings.showDetails, !event.details.isEmpty { Text(event.details).font(.caption).foregroundColor(.secondary).padding(.top, 2).lineLimit(4) }
             if displaySettings.showPeople { peopleList }
             if displaySettings.showLocations { locationList }
@@ -1020,6 +1025,9 @@ struct EventView: View {
         VStack(alignment: .leading, spacing: 2) {
             if displaySettings.showTitle { Text(event.title).font(.system(size: 14, weight: .bold)).lineLimit(2) }
             Text(dateString()).font(.caption).foregroundColor(.secondary).lineLimit(2)
+            if displaySettings.showDuration, let durationText = formattedDuration() {
+                Label(durationText, systemImage: "hourglass").font(.caption).foregroundColor(.secondary)
+            }
             if displaySettings.showDetails, !event.details.isEmpty { Text(event.details).font(.caption).foregroundColor(.secondary.opacity(0.8)).padding(.top, 2).lineLimit(3) }
             if displaySettings.showPeople { peopleList.padding(.top, 2) }
             if displaySettings.showLocations { locationList }
@@ -1056,6 +1064,17 @@ struct EventView: View {
         if event.precision == .time { let sameDay = Calendar.current.isDate(event.startDate, inSameDayAs: endDate); endString = sameDay ? endDate.formatted(timeFormat) : endDate.formatted(dateFormat) + ", " + endDate.formatted(timeFormat)
         } else { endString = endDate.formatted(dateFormat) }
         return startString == endString ? startString : "\(startString) – \(endString)"
+    }
+    
+    private func formattedDuration() -> String? {
+        guard event.isDuration, event.effectiveDuration > 0 else { return nil }
+        
+        let formatter = DateComponentsFormatter()
+        formatter.unitsStyle = .abbreviated
+        formatter.allowedUnits = [.year, .month, .day, .hour, .minute]
+        formatter.maximumUnitCount = 2
+        
+        return formatter.string(from: event.effectiveDuration)
     }
 }
 
@@ -1100,7 +1119,8 @@ struct TimelineSettingsView: View {
                 
                 Section("Display & Interaction") {
                     Toggle("Enable Dragging", isOn: $displaySettings.isDragEnabled)
-                    Toggle("Tap to Add New Event", isOn: $displaySettings.isTapToAddEnabled)
+                    Toggle("Tap Timeline to Add Event", isOn: $displaySettings.isTapToAddEnabled)
+                    Toggle("Show Duration", isOn: $displaySettings.showDuration)
                     Toggle("Show Title", isOn: $displaySettings.showTitle)
                     Toggle("Show Details", isOn: $displaySettings.showDetails)
                     Toggle("Show People", isOn: $displaySettings.showPeople)
@@ -1136,6 +1156,7 @@ struct EventEditorView: View {
     @State private var details: String = ""
     @State private var startDate: Date = .now
     @State private var endDate: Date? = nil
+    @State private var hasEndDate: Bool = false
     @State private var precision: TimePrecision = .day
     @State private var isArcEvent: Bool = false
     @State private var showDeleteConfirmation = false
@@ -1172,22 +1193,29 @@ struct EventEditorView: View {
                     if colorHex != nil { Button("Clear Color", role: .destructive) { colorHex = nil; customColor = .accentColor } }
                 }
                 
-                if !isArcEvent {
-                    Section("Precision") {
+                Section("Date & Time") {
+                    if !isArcEvent {
                         Picker("Precision", selection: $precision.animation()) {
                             ForEach(TimePrecision.allCases, id: \.self) { p in Text(p.description).tag(p) }
-                        }.pickerStyle(.segmented)
+                        }
+                        .pickerStyle(.segmented)
+                        .padding(.bottom, 4)
                     }
-                }
-                
-                Section("Start") { DatePicker("Date", selection: $startDate, in: timelineRange, displayedComponents: precision == .time && !isArcEvent ? [.date, .hourAndMinute] : [.date]) }
-                
-                Section("End") {
-                    if let binding = Binding($endDate) {
-                        DatePicker("Date", selection: binding, in: startDate..., displayedComponents: precision == .time && !isArcEvent ? [.date, .hourAndMinute] : [.date])
-                        Button("Remove End Date", role: .destructive) { endDate = nil }
-                    } else {
-                        Button("Add End Date") { endDate = startDate.addingTimeInterval(3600) }
+
+                    DatePicker("Start", selection: $startDate, in: timelineRange, displayedComponents: precision == .time && !isArcEvent ? [.date, .hourAndMinute] : [.date])
+
+                    Toggle("End Date", isOn: $hasEndDate.animation())
+
+                    if hasEndDate {
+                        DatePicker(
+                            "End",
+                            selection: Binding(
+                                get: { endDate ?? startDate },
+                                set: { endDate = $0 }
+                            ),
+                            in: startDate...,
+                            displayedComponents: precision == .time && !isArcEvent ? [.date, .hourAndMinute] : [.date]
+                        )
                     }
                 }
                 
@@ -1222,6 +1250,15 @@ struct EventEditorView: View {
             .onAppear(perform: setupInitialState)
             .onChange(of: customColor) { _, newColor in colorHex = newColor.toHex() }
             .onChange(of: isArcEvent) { _, newIsArc in if newIsArc { precision = .day } }
+            .onChange(of: hasEndDate) { _, isEnabled in
+                if isEnabled {
+                    if endDate == nil {
+                        endDate = startDate.addingTimeInterval(3600)
+                    }
+                } else {
+                    endDate = nil
+                }
+            }
             .alert("Delete Event?", isPresented: $showDeleteConfirmation) { Button("Delete", role: .destructive, action: deleteEvent); Button("Cancel", role: .cancel) {} } message: { Text("This action cannot be undone.") }
             .alert("New Person", isPresented: $showAddPersonAlert) { TextField("Name", text: $newPersonName); Button("Add", action: createAndSelectPerson).disabled(newPersonName.trimmingCharacters(in: .whitespaces).isEmpty); Button("Cancel", role: .cancel) {} }
             .alert("New Location", isPresented: $showAddLocationAlert) { TextField("Name", text: $newLocationName); Button("Add", action: createAndSelectLocation).disabled(newLocationName.trimmingCharacters(in: .whitespaces).isEmpty); Button("Cancel", role: .cancel) {} }
@@ -1231,11 +1268,13 @@ struct EventEditorView: View {
     private func setupInitialState() {
         if let event {
             title = event.title; details = event.details; startDate = event.startDate; endDate = event.endDate; precision = event.precision; colorHex = event.colorHex; isArcEvent = event.isArcEvent
+            hasEndDate = event.endDate != nil
             selectedPeople = Set(event.people ?? []); selectedLocations = Set(event.locations ?? [])
             customColor = Color(hex: colorHex) ?? .accentColor
         } else {
             let date = initialDate ?? Calendar.current.date(byAdding: .day, value: 1, to: timelineRange.lowerBound) ?? .now
             startDate = timelineRange.contains(date) ? date : timelineRange.lowerBound
+            hasEndDate = false
         }
     }
     
@@ -1244,7 +1283,9 @@ struct EventEditorView: View {
         let finalPrecision = isArcEvent ? .day : precision
         let finalStartDate = finalPrecision == .day ? calendar.startOfDay(for: startDate) : startDate
         var finalEndDate: Date?
-        if let currentEndDate = endDate { finalEndDate = finalPrecision == .day ? calendar.startOfDay(for: currentEndDate) : currentEndDate }
+        if let currentEndDate = endDate {
+            finalEndDate = finalPrecision == .day ? calendar.startOfDay(for: currentEndDate) : currentEndDate
+        }
 
         if let event {
             event.title = title; event.details = isArcEvent ? "" : details; event.startDate = finalStartDate; event.endDate = finalEndDate; event.precision = finalPrecision; event.colorHex = colorHex; event.isArcEvent = isArcEvent
