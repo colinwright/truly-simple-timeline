@@ -7,6 +7,6 @@ struct TrulySimpleTimelineApp: App {
         WindowGroup {
             ContentView()
         }
-        .modelContainer(for: [Event.self, Character.self])
+        .modelContainer(for: [Event.self, Person.self, Location.self])
     }
 }
