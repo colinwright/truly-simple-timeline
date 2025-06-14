@@ -1,7 +1,35 @@
 import SwiftUI
 import SwiftData
 
-// MARK: - Models & Configuration
+// MARK: - Models
+
+@Model
+final class Timeline {
+    @Attribute(.unique) var id: UUID
+    var name: String
+    var startDate: Date
+    var endDate: Date
+    
+    @Relationship(deleteRule: .cascade, inverse: \Event.timeline)
+    var events: [Event]?
+    
+    init(name: String, startDate: Date, endDate: Date) {
+        self.id = UUID()
+        self.name = name
+        self.startDate = startDate
+        self.endDate = endDate
+    }
+    
+    var dateRange: ClosedRange<Date> {
+        startDate...endDate
+    }
+}
+
+extension Timeline: Equatable {
+    static func == (lhs: Timeline, rhs: Timeline) -> Bool {
+        lhs.persistentModelID == rhs.persistentModelID
+    }
+}
 
 @Model
 final class Person {
@@ -47,6 +75,8 @@ final class Event {
     var colorHex: String?
     var isArcEvent: Bool = false
     
+    var timeline: Timeline?
+
     @Relationship(inverse: \Person.events)
     var people: [Person]?
 
@@ -84,35 +114,6 @@ final class Event {
             return endDay.timeIntervalSince(startDay) + 86400
         }
         return duration
-    }
-}
-
-@Observable
-class TimelineConfiguration {
-    private let startDateKey = "timelineStartDate"
-    private let endDateKey = "timelineEndDate"
-
-    var startDate: Date
-    var endDate: Date
-    var isConfigured: Bool = false
-
-    init() {
-        if let startInterval = UserDefaults.standard.object(forKey: startDateKey) as? TimeInterval,
-           let endInterval = UserDefaults.standard.object(forKey: endDateKey) as? TimeInterval {
-            self.startDate = Date(timeIntervalSince1970: startInterval)
-            self.endDate = Date(timeIntervalSince1970: endInterval)
-            self.isConfigured = true
-        } else {
-            self.startDate = .now.addingTimeInterval(-86400 * 30)
-            self.endDate = .now
-            self.isConfigured = false
-        }
-    }
-
-    func save() {
-        UserDefaults.standard.set(startDate.timeIntervalSince1970, forKey: startDateKey)
-        UserDefaults.standard.set(endDate.timeIntervalSince1970, forKey: endDateKey)
-        self.isConfigured = true
     }
 }
 
@@ -157,7 +158,6 @@ class DisplaySettings {
     }
 }
 
-
 // MARK: - Undo/Redo Manager
 
 @Observable
@@ -178,12 +178,12 @@ class UndoRedoManager {
         redoStack.removeAll()
     }
 
-    func performUndo(on events: [Event]) {
+    func performUndo(context: ModelContext) {
         guard let action = undoStack.popLast() else { return }
         
         switch action {
         case .move(let eventID, let fromDate, let toDate):
-            if let event = findEvent(by: eventID, in: events) {
+            if let event = findEvent(by: eventID, in: context) {
                 applyMove(to: event, newDate: fromDate)
                 let redoAction = Action.move(eventID: eventID, from: fromDate, to: toDate)
                 redoStack.append(redoAction)
@@ -191,12 +191,12 @@ class UndoRedoManager {
         }
     }
 
-    func performRedo(on events: [Event]) {
+    func performRedo(context: ModelContext) {
         guard let action = redoStack.popLast() else { return }
         
         switch action {
         case .move(let eventID, let fromDate, let toDate):
-            if let event = findEvent(by: eventID, in: events) {
+            if let event = findEvent(by: eventID, in: context) {
                 applyMove(to: event, newDate: toDate)
                 let undoAction = Action.move(eventID: eventID, from: fromDate, to: toDate)
                 undoStack.append(undoAction)
@@ -209,8 +209,8 @@ class UndoRedoManager {
         redoStack.removeAll()
     }
 
-    private func findEvent(by id: PersistentIdentifier, in events: [Event]) -> Event? {
-        return events.first { $0.persistentModelID == id }
+    private func findEvent(by id: PersistentIdentifier, in context: ModelContext) -> Event? {
+        context.model(for: id) as? Event
     }
     
     private func applyMove(to event: Event, newDate: Date) {
@@ -223,20 +223,86 @@ class UndoRedoManager {
 }
 
 
-// MARK: - Main View
+// MARK: - Root View & Timeline Management
+
+struct ContentView: View {
+    @Query(sort: \Timeline.name) private var timelines: [Timeline]
+    @State private var activeTimeline: Timeline?
+    @State private var showTimelineSelector = false
+    
+    private let lastActiveTimelineKey = "lastActiveTimelineID"
+
+    var body: some View {
+        Group {
+            if let activeTimeline {
+                TimelineDetailView(timeline: activeTimeline, showTimelineSelector: $showTimelineSelector)
+            } else {
+                ZStack {
+                    Color(.systemGroupedBackground).ignoresSafeArea()
+                    VStack(spacing: 20) {
+                        Image(systemName: "text.book.closed")
+                            .font(.system(size: 50))
+                            .foregroundStyle(.secondary)
+                        Text("No Timelines")
+                            .font(.title.bold())
+                        Text("Create a timeline to get started.")
+                            .foregroundStyle(.secondary)
+                        Button("Create New Timeline") {
+                            showTimelineSelector = true
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                    .padding()
+                }
+            }
+        }
+        .onAppear(perform: loadInitialTimeline)
+        .onChange(of: timelines) { _, _ in loadInitialTimeline() }
+        .onChange(of: activeTimeline) { _, newValue in
+            saveActiveTimeline(newValue: newValue)
+        }
+        .sheet(isPresented: $showTimelineSelector) {
+            TimelineSelectorView(activeTimeline: $activeTimeline)
+        }
+    }
+
+    private func loadInitialTimeline() {
+        if !timelines.isEmpty && activeTimeline == nil {
+            if let idString = UserDefaults.standard.string(forKey: lastActiveTimelineKey),
+               let id = UUID(uuidString: idString),
+               let lastUsed = timelines.first(where: { $0.id == id }) {
+                activeTimeline = lastUsed
+            } else {
+                activeTimeline = timelines.first
+            }
+        } else if timelines.isEmpty {
+            activeTimeline = nil
+        }
+    }
+    
+    private func saveActiveTimeline(newValue: Timeline?) {
+        if let newID = newValue?.id.uuidString {
+            UserDefaults.standard.set(newID, forKey: lastActiveTimelineKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: lastActiveTimelineKey)
+        }
+    }
+}
 
 fileprivate struct NewEventRequest: Identifiable {
     let id = UUID()
     let date: Date
 }
 
-struct ContentView: View {
+struct TimelineDetailView: View {
     @Environment(\.modelContext) private var modelContext
-    @Query(sort: \Event.startDate) private var events: [Event]
+    let timeline: Timeline
+    @Binding var showTimelineSelector: Bool
+    
+    @Query private var events: [Event]
 
-    @State private var config = TimelineConfiguration()
     @State private var displaySettings = DisplaySettings()
-    @State private var showSettings = false
+    @State private var showDisplaySettings = false
     @State private var showEventEditor = false
     @State private var eventToEdit: Event?
     @State private var newEventRequest: NewEventRequest?
@@ -252,6 +318,14 @@ struct ContentView: View {
     
     @State private var undoRedoManager = UndoRedoManager()
     
+    init(timeline: Timeline, showTimelineSelector: Binding<Bool>) {
+        self.timeline = timeline
+        self._showTimelineSelector = showTimelineSelector
+        
+        let timelineID = timeline.persistentModelID
+        self._events = Query(filter: #Predicate { $0.timeline?.persistentModelID == timelineID }, sort: \Event.startDate)
+    }
+
     private var canScrollToNext: Bool {
         guard let visibleInterval = getVisibleInterval() else { return false }
         return events.contains { $0.startDate > visibleInterval.end }
@@ -267,40 +341,36 @@ struct ContentView: View {
             GeometryReader { geometry in
                 let orientation: TimelineOrientation = geometry.size.width > geometry.size.height ? .horizontal : .vertical
                 
-                Group {
-                    if !config.isConfigured {
-                        ContentUnavailableView( "Setup Your Timeline", systemImage: "calendar.badge.plus", description: Text("Define a start and end date for your timeline to begin.") )
-                    } else {
-                        TimelineView(
-                            events: events,
-                            config: config,
-                            displaySettings: displaySettings,
-                            orientation: orientation,
-                            visibleSize: geometry.size,
-                            eventToEdit: $eventToEdit,
-                            zoomScale: $zoomScale,
-                            centerDate: $centerDate,
-                            scrollPosition: $scrollPosition,
-                            isScrollingProgrammatically: $isScrollingProgrammatically,
-                            onEventMoved: { event, oldStartDate in
-                                undoRedoManager.addMoveAction(event: event, from: oldStartDate)
-                            },
-                            onTapDate: { date in
-                                newEventRequest = NewEventRequest(date: date)
-                            }
-                        )
+                TimelineView(
+                    events: events,
+                    timeline: timeline,
+                    displaySettings: displaySettings,
+                    orientation: orientation,
+                    visibleSize: geometry.size,
+                    eventToEdit: $eventToEdit,
+                    zoomScale: $zoomScale,
+                    centerDate: $centerDate,
+                    scrollPosition: $scrollPosition,
+                    isScrollingProgrammatically: $isScrollingProgrammatically,
+                    onEventMoved: { event, oldStartDate in
+                        undoRedoManager.addMoveAction(event: event, from: oldStartDate)
+                    },
+                    onTapDate: { date in
+                        newEventRequest = NewEventRequest(date: date)
                     }
-                }
+                )
                 .onAppear { timelineVisibleSize = geometry.size }
                 .onChange(of: geometry.size) { _, newSize in timelineVisibleSize = newSize }
-                .navigationTitle("Timeline")
+                .navigationTitle(timeline.name)
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItemGroup(placement: .navigationBarLeading) {
-                        Button("Undo", systemImage: "arrow.uturn.backward") { undoRedoManager.performUndo(on: events) }
+                        Button { showTimelineSelector = true } label: { Image(systemName: "list.bullet") }
+                        
+                        Button("Undo", systemImage: "arrow.uturn.backward") { undoRedoManager.performUndo(context: modelContext) }
                             .disabled(!undoRedoManager.canUndo)
                         
-                        Button("Redo", systemImage: "arrow.uturn.forward") { undoRedoManager.performRedo(on: events) }
+                        Button("Redo", systemImage: "arrow.uturn.forward") { undoRedoManager.performRedo(context: modelContext) }
                             .disabled(!undoRedoManager.canRedo)
                     }
                     ToolbarItemGroup(placement: .bottomBar) {
@@ -317,34 +387,29 @@ struct ContentView: View {
                     }
                     ToolbarItemGroup(placement: .navigationBarTrailing) {
                         Button { showEventEditor = true } label: { Image(systemName: "plus") }
-                        Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                        Button { showDisplaySettings = true } label: { Image(systemName: "gearshape") }
                     }
                 }
-                .task(id: config.isConfigured) {
-                    guard config.isConfigured else { return }
+                .task(id: timeline.id) {
                     let axisLength = orientation == .vertical ? geometry.size.height : geometry.size.width
                     guard axisLength > 0 else { return }
-                    let metrics = TimelineMetrics(config: config)
-                    let totalDuration = config.endDate.timeIntervalSince(config.startDate)
+                    let metrics = TimelineMetrics(timeline: timeline)
+                    let totalDuration = timeline.endDate.timeIntervalSince(timeline.startDate)
                     zoomScale = metrics.calculateMinZoom(for: axisLength)
-                    centerDate = config.startDate.addingTimeInterval(totalDuration / 2.0)
+                    centerDate = timeline.startDate.addingTimeInterval(totalDuration / 2.0)
+                    undoRedoManager.clearHistory()
                 }
             }
-            .sheet(isPresented: $showSettings) { TimelineSettingsView(config: config, displaySettings: displaySettings) }
-            .sheet(isPresented: $showEventEditor) { EventEditorView(timelineRange: config.dateRange) }
-            .sheet(item: $eventToEdit) { event in EventEditorView(event: event, timelineRange: config.dateRange) }
+            .sheet(isPresented: $showDisplaySettings) { DisplaySettingsView(displaySettings: displaySettings) }
+            .sheet(isPresented: $showEventEditor) { EventEditorView(timeline: timeline) }
+            .sheet(item: $eventToEdit) { event in EventEditorView(event: event, timeline: timeline) }
             .sheet(item: $newEventRequest) { request in
-                EventEditorView(timelineRange: config.dateRange, initialDate: request.date)
+                EventEditorView(timeline: timeline, initialDate: request.date)
             }
             .sheet(isPresented: $showScrollToDateView) {
-                ScrollToDateView(timelineRange: config.dateRange) { date in
+                ScrollToDateView(timelineRange: timeline.dateRange) { date in
                     programmaticallyScroll(toDate: date)
                     showScrollToDateView = false
-                }
-            }
-            .onAppear {
-                if !config.isConfigured {
-                    showSettings = true
                 }
             }
             .onChange(of: showEventEditor) { _, isShowing in if isShowing { undoRedoManager.clearHistory() } }
@@ -378,7 +443,7 @@ struct ContentView: View {
     }
     
     private func getVisibleInterval() -> DateInterval? {
-        let metrics = TimelineMetrics(config: config)
+        let metrics = TimelineMetrics(timeline: timeline)
         let orientation: TimelineOrientation = timelineVisibleSize.width > timelineVisibleSize.height ? .horizontal : .vertical
         let axisLength = orientation == .vertical ? timelineVisibleSize.height : timelineVisibleSize.width
         guard axisLength > 0 else { return nil }
@@ -408,7 +473,7 @@ struct ContentView: View {
     }
     
     private func updateCenterDateFromScroll(position: CGFloat) {
-        let metrics = TimelineMetrics(config: config)
+        let metrics = TimelineMetrics(timeline: timeline)
         let orientation: TimelineOrientation = timelineVisibleSize.width > timelineVisibleSize.height ? .horizontal : .vertical
         let axisLength = orientation == .vertical ? timelineVisibleSize.height : timelineVisibleSize.width
         guard axisLength > 0 else { return }
@@ -418,17 +483,11 @@ struct ContentView: View {
     }
 }
 
-extension TimelineConfiguration {
-    var dateRange: ClosedRange<Date> {
-        startDate...endDate
-    }
-}
-
 // MARK: - Timeline View & Components
 
 struct TimelineView: View {
     let events: [Event]
-    let config: TimelineConfiguration
+    let timeline: Timeline
     let displaySettings: DisplaySettings
     let orientation: TimelineOrientation
     let visibleSize: CGSize
@@ -442,21 +501,11 @@ struct TimelineView: View {
     let onEventMoved: (Event, Date) -> Void
     let onTapDate: (Date) -> Void
     
-    private var metrics: TimelineMetrics { TimelineMetrics(config: config) }
+    private var metrics: TimelineMetrics { TimelineMetrics(timeline: timeline) }
 
     var body: some View {
         Group {
-            if events.isEmpty && config.isConfigured {
-                TimelineNoEventsView(
-                    metrics: metrics,
-                    displaySettings: displaySettings,
-                    orientation: orientation,
-                    visibleSize: visibleSize,
-                    zoomScale: $zoomScale,
-                    scrollPosition: $scrollPosition,
-                    onTapDate: onTapDate
-                )
-            } else if let centerDateBinding = Binding($centerDate) {
+            if let centerDateBinding = Binding($centerDate) {
                 TimelineScrollView(
                     events: events,
                     metrics: metrics,
@@ -468,40 +517,12 @@ struct TimelineView: View {
                     scrollPosition: $scrollPosition,
                     isScrollingProgrammatically: $isScrollingProgrammatically,
                     eventToEdit: $eventToEdit,
-                    isDragEnabled: displaySettings.isDragEnabled,
                     onEventMoved: onEventMoved,
                     onTapDate: onTapDate
                 )
             } else {
                 Color.clear
             }
-        }
-    }
-}
-
-struct TimelineNoEventsView: View {
-    let metrics: TimelineMetrics
-    let displaySettings: DisplaySettings
-    let orientation: TimelineOrientation
-    let visibleSize: CGSize
-    @Binding var zoomScale: CGFloat
-    @Binding var scrollPosition: CGFloat
-    let onTapDate: (Date) -> Void
-    
-    var body: some View {
-        ZStack {
-            TimelineBackground(
-                metrics: metrics,
-                displaySettings: displaySettings,
-                zoomScale: zoomScale,
-                orientation: orientation,
-                axisSize: 60,
-                visibleSize: visibleSize,
-                scrollPosition: $scrollPosition,
-                events: [],
-                onTapDate: onTapDate
-            )
-            ContentUnavailableView("No Events Yet", systemImage: "note.text.badge.plus", description: Text("Tap the + button or tap on the timeline to add your first event."))
         }
     }
 }
@@ -519,16 +540,17 @@ struct TimelineScrollView: View {
     @Binding var isScrollingProgrammatically: Bool
     @Binding var eventToEdit: Event?
     
-    let isDragEnabled: Bool
     let onEventMoved: (Event, Date) -> Void
     let onTapDate: (Date) -> Void
 
     private struct DragState {
         let event: Event
         let originalStartDate: Date
+        let originalDuration: TimeInterval
     }
     
     @State private var dragState: DragState?
+    @State private var dragOffset: CGSize = .zero
     @State private var initialZoomScale: CGFloat?
     
     private let axisSize: CGFloat = 60
@@ -542,7 +564,7 @@ struct TimelineScrollView: View {
     }
     
     private var contentSize: CGSize {
-        let totalLength = metrics.pureLength(for: metrics.config.dateRange.upperBound.timeIntervalSince(metrics.config.dateRange.lowerBound), at: zoomScale)
+        let totalLength = metrics.pureLength(for: metrics.timeline.endDate.timeIntervalSince(metrics.timeline.startDate), at: zoomScale)
         return orientation == .vertical
             ? CGSize(width: visibleSize.width, height: totalLength)
             : CGSize(width: totalLength, height: visibleSize.height)
@@ -582,7 +604,7 @@ struct TimelineScrollView: View {
                                     y: orientation == .vertical ? startPos : 0
                                 )
                                 .onTapGesture { eventToEdit = arcEvent }
-                                .if(isDragEnabled) { view in
+                                .if(displaySettings.isDragEnabled) { view in
                                     view.gesture(dragGesture(for: arcEvent))
                                 }
                         }
@@ -594,13 +616,16 @@ struct TimelineScrollView: View {
                         EventView(event: layout.event, orientation: orientation, displaySettings: displaySettings)
                             .frame(width: layout.frame.width, height: layout.frame.height)
                             .offset(x: layout.frame.minX, y: layout.frame.minY)
+                            .if(isBeingDragged) { view in
+                                view.offset(x: dragOffset.width, y: dragOffset.height)
+                            }
                             .scaleEffect(isBeingDragged ? 1.05 : 1.0)
                             .opacity(isBeingDragged ? 0.75 : 1.0)
                             .zIndex(isBeingDragged ? 1 : 0)
                             .if(!layout.event.isArcEvent) { view in
                                 view.onTapGesture { eventToEdit = layout.event }
                             }
-                            .if(isDragEnabled && !layout.event.isArcEvent) { view in
+                            .if(displaySettings.isDragEnabled && !layout.event.isArcEvent) { view in
                                 view.gesture(dragGesture(for: layout.event))
                             }
                     }
@@ -678,27 +703,27 @@ struct TimelineScrollView: View {
             .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .named(scrollCoordinateSpace))
                 .onChanged { value in
                     if dragState == nil {
-                        dragState = DragState(event: event, originalStartDate: event.startDate)
+                        dragState = DragState(event: event, originalStartDate: event.startDate, originalDuration: event.duration)
                         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                     }
-                    
-                    guard let currentDrag = dragState else { return }
-                    
-                    let dragLength = orientation == .vertical ? value.translation.height : value.translation.width
-                    let timeOffset = dragLength / metrics.pointsPerSecond(at: zoomScale)
-                    let originalDuration = currentDrag.event.duration
-                    
-                    let newStartDate = currentDrag.originalStartDate.addingTimeInterval(timeOffset)
-                    currentDrag.event.startDate = newStartDate
-                    
-                    if currentDrag.event.isDuration {
-                        currentDrag.event.endDate = newStartDate.addingTimeInterval(originalDuration)
-                    }
+                    self.dragOffset = value.translation
                 }
                 .onEnded { value in
                     guard let endedDrag = dragState else { return }
+                    
+                    let dragLength = orientation == .vertical ? value.translation.height : value.translation.width
+                    let timeOffset = dragLength / metrics.pointsPerSecond(at: zoomScale)
+                    let newStartDate = endedDrag.originalStartDate.addingTimeInterval(timeOffset)
+                    
+                    endedDrag.event.startDate = newStartDate
+                    if endedDrag.event.isDuration {
+                        endedDrag.event.endDate = newStartDate.addingTimeInterval(endedDrag.originalDuration)
+                    }
+
                     onEventMoved(endedDrag.event, endedDrag.originalStartDate)
+                    
                     dragState = nil
+                    dragOffset = .zero
                 }
             )
     }
@@ -839,8 +864,8 @@ struct LayoutEvent: Identifiable {
     var id: ObjectIdentifier { event.id }
 }
 struct TimelineMetrics {
-    let config: TimelineConfiguration
-    var bounds: ClosedRange<Date> { config.dateRange }
+    let timeline: Timeline
+    var bounds: ClosedRange<Date> { timeline.dateRange }
     
     func pointsPerSecond(at zoomScale: CGFloat) -> CGFloat { (120.0 * zoomScale) / 3600 }
     func position(for date: Date, at zoomScale: CGFloat) -> CGFloat { date.timeIntervalSince(bounds.lowerBound) * pointsPerSecond(at: zoomScale) }
@@ -849,7 +874,7 @@ struct TimelineMetrics {
     func dateInterval(for position: CGFloat, length: CGFloat, at zoomScale: CGFloat) -> DateInterval { DateInterval(start: date(at: position, for: zoomScale), end: date(at: position + length, for: zoomScale)) }
     
     func calculateMinZoom(for axisLength: CGFloat) -> CGFloat {
-        let totalDuration = config.dateRange.upperBound.timeIntervalSince(config.dateRange.lowerBound)
+        let totalDuration = timeline.dateRange.upperBound.timeIntervalSince(timeline.dateRange.lowerBound)
         guard totalDuration > 0, axisLength > 0 else { return 1.0 }
         let totalLengthAtScaleOne = pureLength(for: totalDuration, at: 1.0)
         return totalLengthAtScaleOne > axisLength ? axisLength / totalLengthAtScaleOne : 1.0
@@ -1104,19 +1129,13 @@ struct ScrollToDateView: View {
     }
 }
 
-struct TimelineSettingsView: View {
-    @Bindable var config: TimelineConfiguration
+struct DisplaySettingsView: View {
     @Bindable var displaySettings: DisplaySettings
     @Environment(\.dismiss) var dismiss
     
     var body: some View {
         NavigationStack {
             Form {
-                Section("Timeline Range") {
-                    DatePicker("Start Date", selection: $config.startDate, displayedComponents: .date)
-                    DatePicker("End Date", selection: $config.endDate, displayedComponents: .date)
-                }
-                
                 Section("Display & Interaction") {
                     Toggle("Enable Dragging", isOn: $displaySettings.isDragEnabled)
                     Toggle("Tap Timeline to Add Event", isOn: $displaySettings.isTapToAddEnabled)
@@ -1127,17 +1146,154 @@ struct TimelineSettingsView: View {
                     Toggle("Show Locations", isOn: $displaySettings.showLocations)
                 }
             }
-            .navigationTitle("Timeline Settings").navigationBarTitleDisplayMode(.inline)
+            .navigationTitle("Display Settings").navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") {
-                        config.save()
                         displaySettings.save()
                         dismiss()
                     }
                 }
             }
         }
+    }
+}
+
+fileprivate struct TimelineRow: View {
+    let timeline: Timeline
+    let isActive: Bool
+
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading) {
+                Text(timeline.name).font(.headline)
+                Text("\(timeline.startDate.formatted(date: .abbreviated, time: .omitted)) – \(timeline.endDate.formatted(date: .abbreviated, time: .omitted))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if isActive {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.tint)
+            }
+        }
+    }
+}
+
+struct TimelineSelectorView: View {
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.dismiss) private var dismiss
+    
+    @Query(sort: \Timeline.name) private var timelines: [Timeline]
+    @Binding var activeTimeline: Timeline?
+    
+    @State private var timelineToEdit: Timeline?
+    @State private var showNewTimelineSheet = false
+    
+    var body: some View {
+        NavigationStack {
+            List {
+                ForEach(timelines) { timeline in
+                    TimelineRow(timeline: timeline, isActive: timeline == activeTimeline)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            activeTimeline = timeline
+                            dismiss()
+                        }
+                        .swipeActions {
+                            Button("Edit", systemImage: "pencil") {
+                                timelineToEdit = timeline
+                            }
+                            .tint(.orange)
+                            
+                            Button("Delete", systemImage: "trash", role: .destructive) {
+                                delete(timeline: timeline)
+                            }
+                        }
+                }
+                .onDelete(perform: deleteFromIndexSet)
+            }
+            .navigationTitle("Timelines")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { Button("Close") { dismiss() } }
+                ToolbarItem(placement: .topBarTrailing) { Button("New", systemImage: "plus") { showNewTimelineSheet = true } }
+            }
+            .sheet(isPresented: $showNewTimelineSheet) {
+                TimelineEditorView(onSave: { newTimeline in
+                    activeTimeline = newTimeline
+                    dismiss()
+                })
+            }
+            .sheet(item: $timelineToEdit) { timeline in
+                TimelineEditorView(timelineToEdit: timeline)
+            }
+        }
+    }
+    
+    private func delete(timeline: Timeline) {
+        if timeline == activeTimeline {
+            activeTimeline = timelines.first(where: { $0.id != timeline.id })
+        }
+        modelContext.delete(timeline)
+    }
+    
+    private func deleteFromIndexSet(at offsets: IndexSet) {
+        for index in offsets {
+            delete(timeline: timelines[index])
+        }
+    }
+}
+
+struct TimelineEditorView: View {
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.dismiss) private var dismiss
+    
+    var timelineToEdit: Timeline?
+    var onSave: ((Timeline) -> Void)?
+    
+    @State private var name: String = ""
+    @State private var startDate: Date = .now
+    @State private var endDate: Date = .now.addingTimeInterval(86400 * 30)
+    
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Timeline Details") {
+                    TextField("Name", text: $name)
+                    DatePicker("Start Date", selection: $startDate, displayedComponents: .date)
+                    DatePicker("End Date", selection: $endDate, in: startDate..., displayedComponents: .date)
+                }
+            }
+            .navigationTitle(timelineToEdit == nil ? "New Timeline" : "Edit Timeline")
+            .navigationBarTitleDisplayMode(.inline)
+            .onAppear(perform: setup)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) { Button("Save", action: save).disabled(name.isEmpty) }
+            }
+        }
+    }
+    
+    private func setup() {
+        if let timeline = timelineToEdit {
+            name = timeline.name
+            startDate = timeline.startDate
+            endDate = timeline.endDate
+        }
+    }
+    
+    private func save() {
+        if let timeline = timelineToEdit {
+            timeline.name = name
+            timeline.startDate = startDate
+            timeline.endDate = endDate
+        } else {
+            let newTimeline = Timeline(name: name, startDate: startDate, endDate: endDate)
+            modelContext.insert(newTimeline)
+            onSave?(newTimeline)
+        }
+        dismiss()
     }
 }
 
@@ -1149,7 +1305,7 @@ struct EventEditorView: View {
     @Query(sort: \Location.name) private var allLocations: [Location]
     
     var event: Event?
-    let timelineRange: ClosedRange<Date>
+    let timeline: Timeline
     var initialDate: Date? = nil
     
     @State private var title: String = ""
@@ -1184,11 +1340,12 @@ struct EventEditorView: View {
                 
                 Section("Look") {
                     Toggle("Arc Event", isOn: $isArcEvent.animation())
-                    HStack(spacing: 16) {
+                    HStack {
                         ForEach(presetColors) { choice in
                             Circle().fill(choice.color).frame(width: 30, height: 30).overlay(Circle().stroke(Color.primary, lineWidth: colorHex == choice.id ? 2 : 0)).onTapGesture { colorHex = choice.id; customColor = choice.color }
                         }
                         ColorPicker("", selection: $customColor, supportsOpacity: false).labelsHidden()
+                        Spacer()
                     }
                     if colorHex != nil { Button("Clear Color", role: .destructive) { colorHex = nil; customColor = .accentColor } }
                 }
@@ -1202,7 +1359,7 @@ struct EventEditorView: View {
                         .padding(.bottom, 4)
                     }
 
-                    DatePicker("Start", selection: $startDate, in: timelineRange, displayedComponents: precision == .time && !isArcEvent ? [.date, .hourAndMinute] : [.date])
+                    DatePicker("Start", selection: $startDate, in: timeline.dateRange, displayedComponents: precision == .time && !isArcEvent ? [.date, .hourAndMinute] : [.date])
 
                     Toggle("End Date", isOn: $hasEndDate.animation())
 
@@ -1213,7 +1370,7 @@ struct EventEditorView: View {
                                 get: { endDate ?? startDate },
                                 set: { endDate = $0 }
                             ),
-                            in: startDate...,
+                            in: startDate...timeline.dateRange.upperBound,
                             displayedComponents: precision == .time && !isArcEvent ? [.date, .hourAndMinute] : [.date]
                         )
                     }
@@ -1272,8 +1429,8 @@ struct EventEditorView: View {
             selectedPeople = Set(event.people ?? []); selectedLocations = Set(event.locations ?? [])
             customColor = Color(hex: colorHex) ?? .accentColor
         } else {
-            let date = initialDate ?? Calendar.current.date(byAdding: .day, value: 1, to: timelineRange.lowerBound) ?? .now
-            startDate = timelineRange.contains(date) ? date : timelineRange.lowerBound
+            let date = initialDate ?? Calendar.current.date(byAdding: .day, value: 1, to: timeline.dateRange.lowerBound) ?? .now
+            startDate = timeline.dateRange.contains(date) ? date : timeline.dateRange.lowerBound
             hasEndDate = false
         }
     }
@@ -1283,7 +1440,7 @@ struct EventEditorView: View {
         let finalPrecision = isArcEvent ? .day : precision
         let finalStartDate = finalPrecision == .day ? calendar.startOfDay(for: startDate) : startDate
         var finalEndDate: Date?
-        if let currentEndDate = endDate {
+        if let currentEndDate = endDate, hasEndDate {
             finalEndDate = finalPrecision == .day ? calendar.startOfDay(for: currentEndDate) : currentEndDate
         }
 
@@ -1292,6 +1449,7 @@ struct EventEditorView: View {
             event.people = isArcEvent ? [] : Array(selectedPeople); event.locations = isArcEvent ? [] : Array(selectedLocations)
         } else {
             let newEvent = Event(startDate: finalStartDate, endDate: finalEndDate, title: title, details: isArcEvent ? "" : details, precision: finalPrecision, colorHex: colorHex, isArcEvent: isArcEvent)
+            newEvent.timeline = timeline
             newEvent.people = isArcEvent ? [] : Array(selectedPeople); newEvent.locations = isArcEvent ? [] : Array(selectedLocations)
             modelContext.insert(newEvent)
         }
@@ -1308,7 +1466,14 @@ struct EventEditorView: View {
 
 struct ColorChoice: Identifiable, Hashable {
     let id: String, color: Color
-    static let presets: [ColorChoice] = [ .init(id: "#5792F2", color: .blue), .init(id: "#4CAF50", color: .green), .init(id: "#FFC107", color: .yellow), .init(id: "#FF9800", color: .orange), .init(id: "#F44336", color: .red), .init(id: "#9C27B0", color: .purple), .init(id: "#607D8B", color: .gray) ]
+    static let presets: [ColorChoice] = [
+        .init(id: "#5792F2", color: .blue),
+        .init(id: "#4CAF50", color: .green),
+        .init(id: "#FFC107", color: .yellow),
+        .init(id: "#FF9800", color: .orange),
+        .init(id: "#F44336", color: .red),
+        .init(id: "#9C27B0", color: .purple)
+    ]
 }
 
 extension Color {
