@@ -126,7 +126,8 @@ class DisplaySettings {
     private let showDurationKey = "displayShowDuration"
     private let isDragEnabledKey = "displayIsDragEnabled"
     private let isTapToAddEnabledKey = "displayIsTapToAddEnabled"
-    
+    private let constrainEventsToBoundsKey = "displayConstrainEventsToBounds"
+
     var showTitle: Bool
     var showDetails: Bool
     var showPeople: Bool
@@ -134,6 +135,7 @@ class DisplaySettings {
     var showDuration: Bool
     var isDragEnabled: Bool
     var isTapToAddEnabled: Bool
+    var constrainEventsToBounds: Bool
 
     init() {
         let defaults = UserDefaults.standard
@@ -144,6 +146,7 @@ class DisplaySettings {
         self.showDuration = defaults.object(forKey: showDurationKey) as? Bool ?? true
         self.isDragEnabled = defaults.object(forKey: isDragEnabledKey) as? Bool ?? true
         self.isTapToAddEnabled = defaults.object(forKey: isTapToAddEnabledKey) as? Bool ?? true
+        self.constrainEventsToBounds = defaults.object(forKey: constrainEventsToBoundsKey) as? Bool ?? true
     }
     
     func save() {
@@ -155,6 +158,7 @@ class DisplaySettings {
         defaults.set(showDuration, forKey: showDurationKey)
         defaults.set(isDragEnabled, forKey: isDragEnabledKey)
         defaults.set(isTapToAddEnabled, forKey: isTapToAddEnabledKey)
+        defaults.set(constrainEventsToBounds, forKey: constrainEventsToBoundsKey)
     }
 }
 
@@ -229,7 +233,8 @@ struct ContentView: View {
     @Query(sort: \Timeline.name) private var timelines: [Timeline]
     @State private var activeTimeline: Timeline?
     @State private var showTimelineSelector = false
-    
+    @State private var showNewTimelineSheet = false
+
     private let lastActiveTimelineKey = "lastActiveTimelineID"
 
     var body: some View {
@@ -237,32 +242,19 @@ struct ContentView: View {
             if let activeTimeline {
                 TimelineDetailView(timeline: activeTimeline, showTimelineSelector: $showTimelineSelector)
             } else {
-                ZStack {
-                    Color(.systemGroupedBackground).ignoresSafeArea()
-                    VStack(spacing: 20) {
-                        Image(systemName: "text.book.closed")
-                            .font(.system(size: 50))
-                            .foregroundStyle(.secondary)
-                        Text("No Timelines")
-                            .font(.title.bold())
-                        Text("Create a timeline to get started.")
-                            .foregroundStyle(.secondary)
-                        Button("Create New Timeline") {
-                            showTimelineSelector = true
-                        }
-                        .buttonStyle(.borderedProminent)
-                    }
-                    .padding()
-                }
+                NoTimelinesView(showNewTimelineSheet: $showNewTimelineSheet)
             }
         }
         .onAppear(perform: loadInitialTimeline)
         .onChange(of: timelines) { _, _ in loadInitialTimeline() }
-        .onChange(of: activeTimeline) { _, newValue in
-            saveActiveTimeline(newValue: newValue)
-        }
+        .onChange(of: activeTimeline) { _, newValue in saveActiveTimeline(newValue: newValue) }
         .sheet(isPresented: $showTimelineSelector) {
             TimelineSelectorView(activeTimeline: $activeTimeline)
+        }
+        .sheet(isPresented: $showNewTimelineSheet) {
+            TimelineEditorView { newTimeline in
+                self.activeTimeline = newTimeline
+            }
         }
     }
 
@@ -285,6 +277,28 @@ struct ContentView: View {
             UserDefaults.standard.set(newID, forKey: lastActiveTimelineKey)
         } else {
             UserDefaults.standard.removeObject(forKey: lastActiveTimelineKey)
+        }
+    }
+}
+
+struct NoTimelinesView: View {
+    @Binding var showNewTimelineSheet: Bool
+    
+    var body: some View {
+        ZStack {
+            Color(UIColor.systemGroupedBackground).ignoresSafeArea()
+            VStack(spacing: 12) {
+                Text("No Timelines")
+                    .font(.title.bold())
+                Text("Create a timeline to get started.")
+                    .foregroundStyle(.secondary)
+                Button("Create New Timeline") {
+                    showNewTimelineSheet = true
+                }
+                .buttonStyle(.borderedProminent)
+                .padding(.top)
+            }
+            .padding()
         }
     }
 }
@@ -317,6 +331,16 @@ struct TimelineDetailView: View {
     @State private var scrollEndDebounceTask: Task<Void, Never>?
     
     @State private var undoRedoManager = UndoRedoManager()
+    
+    private struct TimelineDependencies: Equatable {
+        let id: UUID
+        let startDate: Date
+        let endDate: Date
+    }
+
+    private var timelineDependencies: TimelineDependencies {
+        TimelineDependencies(id: timeline.id, startDate: timeline.startDate, endDate: timeline.endDate)
+    }
     
     init(timeline: Timeline, showTimelineSelector: Binding<Bool>) {
         self.timeline = timeline
@@ -390,21 +414,47 @@ struct TimelineDetailView: View {
                         Button { showDisplaySettings = true } label: { Image(systemName: "gearshape") }
                     }
                 }
-                .task(id: timeline.id) {
+                .task(id: timelineDependencies) {
                     let axisLength = orientation == .vertical ? geometry.size.height : geometry.size.width
                     guard axisLength > 0 else { return }
+                    
+                    undoRedoManager.clearHistory()
+                    isScrollingProgrammatically = true
+                    
                     let metrics = TimelineMetrics(timeline: timeline)
                     let totalDuration = timeline.endDate.timeIntervalSince(timeline.startDate)
-                    zoomScale = metrics.calculateMinZoom(for: axisLength)
+                    
+                    guard totalDuration > 0 else {
+                        zoomScale = 1.0
+                        centerDate = timeline.startDate
+                        return
+                    }
+                    
+                    let buffer = totalDuration * 0.1
+                    let bufferedDuration = totalDuration + buffer
+                    let fitZoom = axisLength / metrics.pureLength(for: bufferedDuration, at: 1.0)
+                    
+                    let threeDaysInSeconds = 86400.0 * 3
+                    if totalDuration <= threeDaysInSeconds {
+                        let desiredHourlySpacing: CGFloat = 100.0
+                        let requiredPointsPerSecond = desiredHourlySpacing / 3600.0
+                        let zoomForHours = requiredPointsPerSecond * 30.0
+                        
+                        zoomScale = max(fitZoom, zoomForHours)
+                    } else {
+                        zoomScale = fitZoom
+                    }
+
                     centerDate = timeline.startDate.addingTimeInterval(totalDuration / 2.0)
-                    undoRedoManager.clearHistory()
                 }
             }
-            .sheet(isPresented: $showDisplaySettings) { DisplaySettingsView(displaySettings: displaySettings) }
-            .sheet(isPresented: $showEventEditor) { EventEditorView(timeline: timeline) }
-            .sheet(item: $eventToEdit) { event in EventEditorView(event: event, timeline: timeline) }
+            .toolbarBackground(.visible, for: .navigationBar, .bottomBar)
+            .toolbarBackground(Color(UIColor.systemGroupedBackground), for: .navigationBar, .bottomBar)
+            .sheet(isPresented: $showDisplaySettings) { DisplaySettingsView(displaySettings: $displaySettings) }
+            .sheet(isPresented: $showEventEditor) { EventEditorView(timeline: timeline, displaySettings: $displaySettings) }
+            .sheet(item: $eventToEdit) { event in EventEditorView(event: event, timeline: timeline, displaySettings: $displaySettings) }
             .sheet(item: $newEventRequest) { request in
-                EventEditorView(timeline: timeline, initialDate: request.date)
+                EventEditorView(timeline: timeline, initialDate: request.date, displaySettings: $displaySettings)
             }
             .sheet(isPresented: $showScrollToDateView) {
                 ScrollToDateView(timelineRange: timeline.dateRange) { date in
@@ -543,13 +593,15 @@ struct TimelineScrollView: View {
     let onEventMoved: (Event, Date) -> Void
     let onTapDate: (Date) -> Void
 
-    private struct DragState {
+    private struct GhostEventInfo {
         let event: Event
         let originalStartDate: Date
         let originalDuration: TimeInterval
+        let layoutFrame: CGRect
     }
-    
-    @State private var dragState: DragState?
+
+    @State private var layouts: [LayoutEvent] = []
+    @State private var ghostEvent: GhostEventInfo?
     @State private var dragOffset: CGSize = .zero
     @State private var initialZoomScale: CGFloat?
     
@@ -558,16 +610,15 @@ struct TimelineScrollView: View {
     private let scrollCoordinateSpace = "scroll"
     private let contentID = "timelineContent"
     
-    private var layouts: [LayoutEvent] {
-        let crossAxisSize = orientation == .vertical ? visibleSize.width - axisSize : visibleSize.height - axisSize
-        return generateLayouts(containerCrossAxisSize: crossAxisSize, draggedEventID: dragState?.event.id)
-    }
-    
     private var contentSize: CGSize {
-        let totalLength = metrics.pureLength(for: metrics.timeline.endDate.timeIntervalSince(metrics.timeline.startDate), at: zoomScale)
-        return orientation == .vertical
-            ? CGSize(width: visibleSize.width, height: totalLength)
-            : CGSize(width: totalLength, height: visibleSize.height)
+        let totalDuration = metrics.timeline.endDate.timeIntervalSince(metrics.timeline.startDate)
+        let totalLength = metrics.pureLength(for: totalDuration, at: zoomScale)
+        
+        if orientation == .vertical {
+            return CGSize(width: visibleSize.width, height: max(totalLength, visibleSize.height))
+        } else {
+            return CGSize(width: max(totalLength, visibleSize.width), height: visibleSize.height)
+        }
     }
     
     var body: some View {
@@ -588,60 +639,37 @@ struct TimelineScrollView: View {
                         onTapDate: onTapDate
                     )
                     
-                    ForEach(events.filter { $0.isArcEvent && $0.isDuration }) { arcEvent in
-                        let startPos = metrics.position(for: arcEvent.startDate, at: zoomScale)
-                        let length = metrics.pureLength(for: arcEvent.effectiveDuration, at: zoomScale)
-                        
-                        if length > 0.5 {
-                            Color.clear
-                                .contentShape(Rectangle())
-                                .frame(
-                                    width: orientation == .vertical ? axisSize : length,
-                                    height: orientation == .vertical ? length : axisSize
-                                )
-                                .offset(
-                                    x: orientation == .vertical ? 0 : startPos,
-                                    y: orientation == .vertical ? startPos : 0
-                                )
-                                .onTapGesture { eventToEdit = arcEvent }
-                                .if(displaySettings.isDragEnabled) { view in
-                                    view.gesture(dragGesture(for: arcEvent))
-                                }
-                        }
-                    }
-                    
                     ForEach(layouts) { layout in
-                        let isBeingDragged = dragState?.event.id == layout.id
-                        
                         EventView(event: layout.event, orientation: orientation, displaySettings: displaySettings)
                             .frame(width: layout.frame.width, height: layout.frame.height)
                             .offset(x: layout.frame.minX, y: layout.frame.minY)
-                            .if(isBeingDragged) { view in
-                                view.offset(x: dragOffset.width, y: dragOffset.height)
-                            }
-                            .scaleEffect(isBeingDragged ? 1.05 : 1.0)
-                            .opacity(isBeingDragged ? 0.75 : 1.0)
-                            .zIndex(isBeingDragged ? 1 : 0)
-                            .if(!layout.event.isArcEvent) { view in
-                                view.onTapGesture { eventToEdit = layout.event }
-                            }
-                            .if(displaySettings.isDragEnabled && !layout.event.isArcEvent) { view in
-                                view.gesture(dragGesture(for: layout.event))
-                            }
+                            .opacity(ghostEvent?.event.id == layout.event.id ? 0 : 1)
+                            .onTapGesture { eventToEdit = layout.event }
+                            .if(displaySettings.isDragEnabled) { $0.gesture(dragGesture(for: layout.event, layout: layout)) }
+                    }
+                    
+                    if let ghost = ghostEvent {
+                        EventView(event: ghost.event, orientation: orientation, displaySettings: displaySettings)
+                            .frame(width: ghost.layoutFrame.width, height: ghost.layoutFrame.height)
+                            .offset(x: ghost.layoutFrame.minX, y: ghost.layoutFrame.minY)
+                            .offset(dragOffset)
+                            .scaleEffect(1.05)
+                            .opacity(0.75)
+                            .zIndex(1)
                     }
                 }
                 .frame(width: contentSize.width, height: contentSize.height)
                 .id(contentID)
             }
             .coordinateSpace(name: scrollCoordinateSpace)
-            .scrollDisabled(dragState != nil)
+            .scrollDisabled(ghostEvent != nil)
             .simultaneousGesture(magnificationGesture(proxy: proxy))
-            .onAppear { scrollTo(date: centerDate, proxy: proxy, animated: false) }
-            .onChange(of: visibleSize) { _, _ in scrollTo(date: centerDate, proxy: proxy, animated: false) }
+            .onAppear(perform: recalculateLayouts)
+            .onChange(of: events) { _, _ in recalculateLayouts() }
+            .onChange(of: zoomScale) { _, _ in recalculateLayouts() }
+            .onChange(of: visibleSize) { _, _ in recalculateLayouts() }
             .onChange(of: centerDate) { _, newDate in
-                if isScrollingProgrammatically {
-                    scrollTo(date: newDate, proxy: proxy, animated: true)
-                }
+                if isScrollingProgrammatically { scrollTo(date: newDate, proxy: proxy, animated: true) }
             }
         }
     }
@@ -651,45 +679,39 @@ struct TimelineScrollView: View {
         guard axisLength > 0 else { return }
 
         let totalLength = orientation == .vertical ? contentSize.height : contentSize.width
-        guard totalLength > 0 else { return }
+        guard totalLength > axisLength else { return }
 
         let targetPosition = metrics.position(for: date, at: zoomScale)
         let desiredOffset = targetPosition - (axisLength / 2)
         let maxOffset = totalLength - axisLength
-        let clampedOffset = max(0, min(desiredOffset, max(0, maxOffset)))
         
+        let clampedOffset = max(0, min(desiredOffset, maxOffset))
+
+        let anchorRatio = maxOffset > 0 ? clampedOffset / maxOffset : 0
         let anchor = orientation == .vertical
-            ? UnitPoint(x: 0, y: clampedOffset / totalLength)
-            : UnitPoint(x: clampedOffset / totalLength, y: 0)
+            ? UnitPoint(x: 0.5, y: anchorRatio)
+            : UnitPoint(x: anchorRatio, y: 0.5)
         
-        let scrollAction = {
-            proxy.scrollTo(contentID, anchor: anchor)
-        }
+        let scrollAction = { proxy.scrollTo(contentID, anchor: anchor) }
         
-        if animated {
-            withAnimation(.snappy) { scrollAction() }
-        } else {
-            scrollAction()
-        }
+        if animated { withAnimation(.snappy) { scrollAction() } } else { scrollAction() }
     }
     
     private func magnificationGesture(proxy: ScrollViewProxy) -> some Gesture {
         MagnificationGesture()
             .onChanged { value in
-                guard dragState == nil else { return }
+                guard ghostEvent == nil else { return }
                 
                 let visibleLength = orientation == .vertical ? visibleSize.height : visibleSize.width
                 guard visibleLength > 0 else { return }
                 
                 isScrollingProgrammatically = true
-
                 let dateAtCenter = metrics.date(at: -scrollPosition + (visibleLength / 2), for: zoomScale)
-                
                 if initialZoomScale == nil { initialZoomScale = zoomScale }
+                
                 if let initial = initialZoomScale {
                     zoomScale = max(calculateMinZoom(), min(maxZoomScale, initial * value))
                 }
-                
                 scrollTo(date: dateAtCenter, proxy: proxy, animated: false)
             }
             .onEnded { _ in
@@ -698,32 +720,55 @@ struct TimelineScrollView: View {
             }
     }
     
-    private func dragGesture(for event: Event) -> some Gesture {
+    private func dragGesture(for event: Event, layout: LayoutEvent) -> some Gesture {
         LongPressGesture(minimumDuration: 0.2)
             .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .named(scrollCoordinateSpace))
                 .onChanged { value in
-                    if dragState == nil {
-                        dragState = DragState(event: event, originalStartDate: event.startDate, originalDuration: event.duration)
+                    if ghostEvent == nil {
+                        ghostEvent = GhostEventInfo(
+                            event: event,
+                            originalStartDate: event.startDate,
+                            originalDuration: event.duration,
+                            layoutFrame: layout.frame
+                        )
                         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                     }
                     self.dragOffset = value.translation
                 }
                 .onEnded { value in
-                    guard let endedDrag = dragState else { return }
-                    
+                    guard let endedDrag = ghostEvent else { return }
+
                     let dragLength = orientation == .vertical ? value.translation.height : value.translation.width
-                    let timeOffset = dragLength / metrics.pointsPerSecond(at: zoomScale)
-                    let newStartDate = endedDrag.originalStartDate.addingTimeInterval(timeOffset)
-                    
-                    endedDrag.event.startDate = newStartDate
-                    if endedDrag.event.isDuration {
-                        endedDrag.event.endDate = newStartDate.addingTimeInterval(endedDrag.originalDuration)
+                    let pps = metrics.pointsPerSecond(at: zoomScale)
+                    guard pps > 0 else {
+                        self.ghostEvent = nil
+                        self.dragOffset = .zero
+                        return
                     }
 
-                    onEventMoved(endedDrag.event, endedDrag.originalStartDate)
+                    let timeOffset = dragLength / pps
+                    let newStartDate = endedDrag.originalStartDate.addingTimeInterval(timeOffset)
                     
-                    dragState = nil
-                    dragOffset = .zero
+                    let eventToMove = endedDrag.event
+                    
+                    if displaySettings.constrainEventsToBounds {
+                        let timelineBounds = metrics.timeline.dateRange
+                        let maxStartDate = timelineBounds.upperBound.addingTimeInterval(-endedDrag.originalDuration)
+                        eventToMove.startDate = min(max(newStartDate, timelineBounds.lowerBound), max(timelineBounds.lowerBound, maxStartDate))
+                    } else {
+                        eventToMove.startDate = newStartDate
+                    }
+                    
+                    if eventToMove.isDuration {
+                        eventToMove.endDate = eventToMove.startDate.addingTimeInterval(endedDrag.originalDuration)
+                    }
+                    
+                    self.ghostEvent = nil
+                    self.dragOffset = .zero
+                    
+                    recalculateLayouts()
+                    
+                    onEventMoved(eventToMove, endedDrag.originalStartDate)
                 }
             )
     }
@@ -733,107 +778,105 @@ struct TimelineScrollView: View {
         return metrics.calculateMinZoom(for: axisLength)
     }
     
-    private func calculateVisualRect(for event: Event) -> CGRect {
-        let startPos = metrics.position(for: event.startDate, at: zoomScale)
-        let minPoints = orientation == .horizontal ? 180.0 : 44.0
-        let length = max(metrics.pureLength(for: event.effectiveDuration, at: zoomScale), minPoints)
-        return orientation == .vertical ? CGRect(x: 0, y: startPos, width: 1, height: length) : CGRect(x: startPos, y: 0, width: length, height: 1)
+    private func recalculateLayouts() {
+        guard ghostEvent == nil else { return }
+        let crossAxisSize = orientation == .vertical ? visibleSize.width - axisSize : visibleSize.height - axisSize
+        self.layouts = generateLayouts(containerCrossAxisSize: crossAxisSize)
     }
 
-    private func generateLayouts(containerCrossAxisSize: CGFloat, draggedEventID: ObjectIdentifier?) -> [LayoutEvent] {
-        var layouts: [LayoutEvent] = []
-        
+    private func generateLayouts(containerCrossAxisSize: CGFloat) -> [LayoutEvent] {
+        var newLayouts: [LayoutEvent] = []
         let arcEvents = events.filter { $0.isArcEvent }
         let regularEvents = events.filter { !$0.isArcEvent }
 
         let hasArcLane = !arcEvents.isEmpty
         let arcLaneSize: CGFloat = 10.0
+        let touchExpansion: CGFloat = 12.0
         for event in arcEvents {
             let startPos = metrics.position(for: event.startDate, at: zoomScale)
             let length = metrics.pureLength(for: event.effectiveDuration, at: zoomScale)
-            let frame: CGRect
-            if orientation == .vertical {
-                frame = CGRect(x: axisSize, y: startPos, width: arcLaneSize, height: max(1, length))
-            } else {
-                frame = CGRect(x: startPos, y: axisSize, width: max(1, length), height: arcLaneSize)
-            }
-            layouts.append(LayoutEvent(event: event, frame: frame))
+            let frame: CGRect = orientation == .vertical ?
+                CGRect(x: axisSize - touchExpansion, y: startPos, width: arcLaneSize + touchExpansion, height: max(1, length)) :
+                CGRect(x: startPos, y: axisSize - touchExpansion, width: max(1, length), height: arcLaneSize + touchExpansion)
+            newLayouts.append(LayoutEvent(event: event, frame: frame))
         }
 
         let regularContainerSize = containerCrossAxisSize - (hasArcLane ? arcLaneSize : 0)
         let regularContainerOffset = axisSize + (hasArcLane ? arcLaneSize : 0)
+        guard !regularEvents.isEmpty, regularContainerSize > 0 else { return newLayouts }
         
-        var remainingEvents = regularEvents
-        while !remainingEvents.isEmpty {
-            var group: [Event] = []
-            var queue: [Event] = [remainingEvents.removeFirst()]
-            group.append(queue.first!)
+        let pps = metrics.pointsPerSecond(at: zoomScale)
+        guard pps > 0 else { return newLayouts }
 
-            while !queue.isEmpty {
-                let current = queue.removeFirst()
-                let currentRect = calculateVisualRect(for: current)
-                
-                let intersecting = remainingEvents.filter {
-                    let otherRect = calculateVisualRect(for: $0)
-                    return currentRect.intersects(otherRect)
-                }
-                
-                for event in intersecting {
-                    group.append(event)
-                    queue.append(event)
-                }
-                remainingEvents.removeAll { intersecting.contains($0) }
-            }
+        let minPoints = orientation == .horizontal ? 180.0 : 44.0
+        let minDuration = minPoints / pps
+
+        let sortedEvents = regularEvents.sorted { $0.startDate < $1.startDate }
+
+        // --- Group overlapping events ---
+        var collisionGroups: [[Event]] = []
+        if let firstEvent = sortedEvents.first {
+            var currentGroup = [firstEvent]
+            var groupVisualEnd = firstEvent.startDate.addingTimeInterval(max(firstEvent.effectiveDuration, minDuration))
             
-            var laneVisualRects: [Int: [CGRect]] = [:]
+            for i in 1..<sortedEvents.count {
+                let event = sortedEvents[i]
+                let eventVisualStart = event.startDate
+                
+                if eventVisualStart < groupVisualEnd {
+                    currentGroup.append(event)
+                    let eventVisualEnd = event.startDate.addingTimeInterval(max(event.effectiveDuration, minDuration))
+                    groupVisualEnd = max(groupVisualEnd, eventVisualEnd)
+                } else {
+                    collisionGroups.append(currentGroup)
+                    currentGroup = [event]
+                    groupVisualEnd = event.startDate.addingTimeInterval(max(event.effectiveDuration, minDuration))
+                }
+            }
+            collisionGroups.append(currentGroup)
+        }
+
+        // --- Process each group independently ---
+        for group in collisionGroups {
+            var lanes: [Date] = []
             var eventLanes: [ObjectIdentifier: Int] = [:]
-            var eventsToProcess = group
 
-            if let draggedEventID = draggedEventID,
-               let draggedEventIndex = eventsToProcess.firstIndex(where: { $0.id == draggedEventID }) {
-                let draggedEvent = eventsToProcess.remove(at: draggedEventIndex)
-                eventLanes[draggedEvent.id] = 0
-                laneVisualRects[0, default: []].append(calculateVisualRect(for: draggedEvent))
-            }
-            
-            for event in eventsToProcess.sorted(by: { $0.startDate < $1.startDate }) {
-                let visualRect = calculateVisualRect(for: event)
-                var assignedLane = 0
-                while true {
-                    if let rectsInLane = laneVisualRects[assignedLane], rectsInLane.contains(where: { $0.intersects(visualRect) }) {
-                        assignedLane += 1
-                    } else {
-                        eventLanes[event.id] = assignedLane
-                        laneVisualRects[assignedLane, default: []].append(visualRect)
+            for event in group {
+                let visualEndTime = event.startDate.addingTimeInterval(max(event.effectiveDuration, minDuration))
+                var placed = false
+                for i in 0..<lanes.count {
+                    if event.startDate >= lanes[i] {
+                        eventLanes[event.id] = i
+                        lanes[i] = visualEndTime
+                        placed = true
                         break
                     }
                 }
+                if !placed {
+                    let newLaneIndex = lanes.count
+                    eventLanes[event.id] = newLaneIndex
+                    lanes.append(visualEndTime)
+                }
             }
             
-            let totalLanes = (laneVisualRects.keys.max() ?? -1) + 1
-            let laneSize = totalLanes > 0 ? max(44, regularContainerSize / CGFloat(totalLanes)) : regularContainerSize
-            
+            let totalLanesInGroup = lanes.count
+            let laneSize = totalLanesInGroup > 0 ? max(44, regularContainerSize / CGFloat(totalLanesInGroup)) : regularContainerSize
+
             for event in group {
                 guard let laneIndex = eventLanes[event.id] else { continue }
                 
                 let startPos = metrics.position(for: event.startDate, at: zoomScale)
-                let minPoints = orientation == .horizontal ? 180.0 : 44.0
                 let mainAxisLength = max(metrics.pureLength(for: event.effectiveDuration, at: zoomScale), minPoints)
-                
                 let crossAxisLaneOffset = CGFloat(laneIndex) * laneSize
                 let crossAxisStart = regularContainerOffset + crossAxisLaneOffset
                 
-                let frame: CGRect
-                if orientation == .vertical {
-                    frame = CGRect(x: crossAxisStart, y: startPos, width: laneSize, height: mainAxisLength)
-                } else {
-                    frame = CGRect(x: startPos, y: crossAxisStart, width: mainAxisLength, height: laneSize)
-                }
-                layouts.append(LayoutEvent(event: event, frame: frame))
+                let frame: CGRect = orientation == .vertical ?
+                    CGRect(x: crossAxisStart, y: startPos, width: laneSize, height: mainAxisLength) :
+                    CGRect(x: startPos, y: crossAxisStart, width: mainAxisLength, height: laneSize)
+                newLayouts.append(LayoutEvent(event: event, frame: frame))
             }
         }
-        
-        return layouts
+        return newLayouts
     }
 }
 
@@ -854,7 +897,9 @@ struct ScrollPositionTracker: View {
         }
         .frame(height: 0)
         .onPreferenceChange(ScrollOffsetPreferenceKey.self) { value in
-            scrollPosition = value
+            if self.scrollPosition != value {
+                self.scrollPosition = value
+            }
         }
     }
 }
@@ -975,23 +1020,61 @@ struct TimelineBackground: View {
         var markers: [(Date, String, Bool)] = []
         let calendar = Calendar.current
         let minMarkerSpacing: CGFloat = 80.0
-        let unit: Calendar.Component, step: Int, minorFormat: Date.FormatStyle, majorFormat: Date.FormatStyle, majorUnit: Calendar.Component
+        let yearSeconds = 31556952.0 // Average, for threshold checks
         let pps = metrics.pointsPerSecond(at: zoomScale)
-        if pps * 3600 > minMarkerSpacing { unit = .hour; step = 1; minorFormat = .dateTime.hour(); majorFormat = .dateTime.hour().day(.defaultDigits).month(.abbreviated); majorUnit = .day
-        } else if pps * 86400 > minMarkerSpacing { unit = .day; step = 1; minorFormat = .dateTime.day(); majorFormat = .dateTime.month(.abbreviated).day(); majorUnit = .month
-        } else if pps * 86400 * 7 > minMarkerSpacing { unit = .day; step = 7; minorFormat = .dateTime.day(); majorFormat = .dateTime.month(.abbreviated).day(); majorUnit = .month
-        } else if pps * 86400 * 30.44 > minMarkerSpacing { unit = .month; step = 1; minorFormat = .dateTime.month(.abbreviated); majorFormat = .dateTime.year().month(.abbreviated); majorUnit = .year
-        } else { unit = .year; step = 1; minorFormat = .dateTime.year(); majorFormat = .dateTime.year(); majorUnit = .year }
-        guard var currentDate = calendar.dateInterval(of: unit, for: visibleInterval.start)?.start else { return [] }
-        if unit == .day, step == 7 { currentDate = calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: currentDate)) ?? currentDate }
+        
+        let scale: (unit: Calendar.Component, step: Int, minorFormat: Date.FormatStyle, majorFormat: Date.FormatStyle, majorUnit: Calendar.Component)
+        
+        if pps * 3600 > minMarkerSpacing {
+            scale = (.hour, 1, .dateTime.hour(), .dateTime.hour().day().month(.abbreviated), .day)
+        } else if pps * 86400 > minMarkerSpacing {
+            scale = (.day, 1, .dateTime.day(), .dateTime.month(.abbreviated).day(), .month)
+        } else if pps * 86400 * 7 > minMarkerSpacing {
+            scale = (.day, 7, .dateTime.day(), .dateTime.month(.abbreviated).day(), .month)
+        } else if pps * yearSeconds / 12 > minMarkerSpacing {
+            scale = (.month, 1, .dateTime.month(.abbreviated), .dateTime.year().month(.abbreviated), .year)
+        } else if pps * yearSeconds > minMarkerSpacing {
+            scale = (.year, 1, .dateTime.year(), .dateTime.year(), .year)
+        } else if pps * yearSeconds * 5 > minMarkerSpacing {
+            scale = (.year, 5, .dateTime.year(), .dateTime.year(), .year)
+        } else if pps * yearSeconds * 10 > minMarkerSpacing {
+            scale = (.year, 10, .dateTime.year(), .dateTime.year(), .year)
+        } else if pps * yearSeconds * 50 > minMarkerSpacing {
+            scale = (.year, 50, .dateTime.year(), .dateTime.year(), .year)
+        } else if pps * yearSeconds * 100 > minMarkerSpacing {
+            scale = (.year, 100, .dateTime.year(), .dateTime.year(), .year)
+        } else {
+            scale = (.year, 1000, .dateTime.year(), .dateTime.year(), .year)
+        }
+        
+        var currentDate: Date
+        if scale.unit == .year && scale.step > 1 {
+            let startYear = calendar.component(.year, from: visibleInterval.start)
+            let roundedStartYear = (startYear / scale.step) * scale.step
+            var components = DateComponents(); components.year = roundedStartYear; components.month = 1; components.day = 1
+            currentDate = calendar.date(from: components) ?? visibleInterval.start
+        } else {
+            guard var date = calendar.dateInterval(of: scale.unit, for: visibleInterval.start)?.start else { return [] }
+            if scale.unit == .day, scale.step == 7 { date = calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: date)) ?? date }
+            currentDate = date
+        }
+
         while currentDate <= visibleInterval.end {
-            let majorUnitValue = calendar.component(majorUnit, from: currentDate)
-            let prevDate = calendar.date(byAdding: .second, value: -1, to: currentDate)!
-            let prevMajorUnitValue = calendar.component(majorUnit, from: prevDate)
-            let isMajor = majorUnitValue != prevMajorUnitValue
-            let label = currentDate.formatted(isMajor ? majorFormat : minorFormat)
+            let isMajor: Bool
+            if scale.unit == .year && scale.step > 1 {
+                let year = calendar.component(.year, from: currentDate)
+                isMajor = year % (scale.step * 10) == 0
+            } else {
+                let majorUnitValue = calendar.component(scale.majorUnit, from: currentDate)
+                let prevDate = calendar.date(byAdding: .second, value: -1, to: currentDate)!
+                let prevMajorUnitValue = calendar.component(scale.majorUnit, from: prevDate)
+                isMajor = majorUnitValue != prevMajorUnitValue
+            }
+
+            let label = currentDate.formatted(isMajor ? scale.majorFormat : scale.minorFormat)
             markers.append((currentDate, label, isMajor))
-            guard let nextDate = calendar.date(byAdding: unit, value: step, to: currentDate) else { break }
+            
+            guard let nextDate = calendar.date(byAdding: scale.unit, value: scale.step, to: currentDate), nextDate > currentDate else { break }
             currentDate = nextDate
         }
         return markers
@@ -1001,6 +1084,9 @@ struct EventView: View {
     let event: Event
     let orientation: TimelineOrientation
     let displaySettings: DisplaySettings
+    
+    private static let dateFormat = Date.FormatStyle.dateTime.month(.abbreviated).day().year()
+    private static let timeFormat = Date.FormatStyle.dateTime.hour().minute()
     
     var body: some View {
         Group {
@@ -1013,7 +1099,16 @@ struct EventView: View {
     }
     
     private var arcBody: some View {
-        RoundedRectangle(cornerRadius: 4).fill(event.color)
+        let arcBarSize: CGFloat = 10.0
+        let alignment: Alignment = orientation == .vertical ? .trailing : .bottom
+
+        return ZStack(alignment: alignment) {
+            Color.clear.contentShape(Rectangle())
+            RoundedRectangle(cornerRadius: 4)
+                .fill(event.color)
+                .if(orientation == .vertical) { $0.frame(width: arcBarSize) }
+                .if(orientation == .horizontal) { $0.frame(height: arcBarSize) }
+        }
     }
     
     private var standardBody: some View {
@@ -1082,24 +1177,36 @@ struct EventView: View {
     }
     
     private func dateString() -> String {
-        let dateFormat = Date.FormatStyle.dateTime.month(.abbreviated).day().year(), timeFormat = Date.FormatStyle.dateTime.hour().minute()
-        let startString = event.precision == .time ? event.startDate.formatted(dateFormat) + ", " + event.startDate.formatted(timeFormat) : event.startDate.formatted(dateFormat)
+        let startString = if event.precision == .time {
+            event.startDate.formatted(Self.dateFormat) + ", " + event.startDate.formatted(Self.timeFormat)
+        } else {
+            event.startDate.formatted(Self.dateFormat)
+        }
+        
         guard let endDate = event.endDate else { return startString }
-        let endString: String
-        if event.precision == .time { let sameDay = Calendar.current.isDate(event.startDate, inSameDayAs: endDate); endString = sameDay ? endDate.formatted(timeFormat) : endDate.formatted(dateFormat) + ", " + endDate.formatted(timeFormat)
-        } else { endString = endDate.formatted(dateFormat) }
+
+        let endString = if event.precision == .time {
+            if Calendar.current.isDate(event.startDate, inSameDayAs: endDate) {
+                endDate.formatted(Self.timeFormat)
+            } else {
+                endDate.formatted(Self.dateFormat) + ", " + endDate.formatted(Self.timeFormat)
+            }
+        } else {
+            endDate.formatted(Self.dateFormat)
+        }
+        
         return startString == endString ? startString : "\(startString) – \(endString)"
     }
     
     private func formattedDuration() -> String? {
-        guard event.isDuration, event.effectiveDuration > 0 else { return nil }
+        guard event.isDuration, event.duration > 0 else { return nil }
         
         let formatter = DateComponentsFormatter()
         formatter.unitsStyle = .abbreviated
         formatter.allowedUnits = [.year, .month, .day, .hour, .minute]
-        formatter.maximumUnitCount = 2
+        formatter.maximumUnitCount = 5
         
-        return formatter.string(from: event.effectiveDuration)
+        return formatter.string(from: event.duration)
     }
 }
 
@@ -1130,7 +1237,7 @@ struct ScrollToDateView: View {
 }
 
 struct DisplaySettingsView: View {
-    @Bindable var displaySettings: DisplaySettings
+    @Binding var displaySettings: DisplaySettings
     @Environment(\.dismiss) var dismiss
     
     var body: some View {
@@ -1140,10 +1247,17 @@ struct DisplaySettingsView: View {
                     Toggle("Enable Dragging", isOn: $displaySettings.isDragEnabled)
                     Toggle("Tap Timeline to Add Event", isOn: $displaySettings.isTapToAddEnabled)
                     Toggle("Show Duration", isOn: $displaySettings.showDuration)
+                }
+                
+                Section("Event Card Content") {
                     Toggle("Show Title", isOn: $displaySettings.showTitle)
                     Toggle("Show Details", isOn: $displaySettings.showDetails)
                     Toggle("Show People", isOn: $displaySettings.showPeople)
                     Toggle("Show Locations", isOn: $displaySettings.showLocations)
+                }
+                
+                Section("Data Rules") {
+                    Toggle("Constrain Events to Timeline Bounds", isOn: $displaySettings.constrainEventsToBounds)
                 }
             }
             .navigationTitle("Display Settings").navigationBarTitleDisplayMode(.inline)
@@ -1167,7 +1281,7 @@ fileprivate struct TimelineRow: View {
         HStack {
             VStack(alignment: .leading) {
                 Text(timeline.name).font(.headline)
-                Text("\(timeline.startDate.formatted(date: .abbreviated, time: .omitted)) – \(timeline.endDate.formatted(date: .abbreviated, time: .omitted))")
+                Text("\(timeline.startDate.formatted()) – \(timeline.endDate.formatted())")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -1211,7 +1325,6 @@ struct TimelineSelectorView: View {
                             }
                         }
                 }
-                .onDelete(perform: deleteFromIndexSet)
             }
             .navigationTitle("Timelines")
             .navigationBarTitleDisplayMode(.inline)
@@ -1222,7 +1335,6 @@ struct TimelineSelectorView: View {
             .sheet(isPresented: $showNewTimelineSheet) {
                 TimelineEditorView(onSave: { newTimeline in
                     activeTimeline = newTimeline
-                    dismiss()
                 })
             }
             .sheet(item: $timelineToEdit) { timeline in
@@ -1237,12 +1349,6 @@ struct TimelineSelectorView: View {
         }
         modelContext.delete(timeline)
     }
-    
-    private func deleteFromIndexSet(at offsets: IndexSet) {
-        for index in offsets {
-            delete(timeline: timelines[index])
-        }
-    }
 }
 
 struct TimelineEditorView: View {
@@ -1254,15 +1360,19 @@ struct TimelineEditorView: View {
     
     @State private var name: String = ""
     @State private var startDate: Date = .now
-    @State private var endDate: Date = .now.addingTimeInterval(86400 * 30)
+    @State private var endDate: Date = .now.addingTimeInterval(86400)
+    
+    private var isFormValid: Bool {
+        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && endDate > startDate
+    }
     
     var body: some View {
         NavigationStack {
             Form {
                 Section("Timeline Details") {
                     TextField("Name", text: $name)
-                    DatePicker("Start Date", selection: $startDate, displayedComponents: .date)
-                    DatePicker("End Date", selection: $endDate, in: startDate..., displayedComponents: .date)
+                    DatePicker("Start", selection: $startDate, displayedComponents: [.date, .hourAndMinute])
+                    DatePicker("End", selection: $endDate, in: startDate..., displayedComponents: [.date, .hourAndMinute])
                 }
             }
             .navigationTitle(timelineToEdit == nil ? "New Timeline" : "Edit Timeline")
@@ -1270,7 +1380,7 @@ struct TimelineEditorView: View {
             .onAppear(perform: setup)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
-                ToolbarItem(placement: .confirmationAction) { Button("Save", action: save).disabled(name.isEmpty) }
+                ToolbarItem(placement: .confirmationAction) { Button("Save", action: save).disabled(!isFormValid) }
             }
         }
     }
@@ -1307,7 +1417,9 @@ struct EventEditorView: View {
     var event: Event?
     let timeline: Timeline
     var initialDate: Date? = nil
+    @Binding var displaySettings: DisplaySettings
     
+    // MARK: State
     @State private var title: String = ""
     @State private var details: String = ""
     @State private var startDate: Date = .now
@@ -1315,24 +1427,44 @@ struct EventEditorView: View {
     @State private var hasEndDate: Bool = false
     @State private var precision: TimePrecision = .day
     @State private var isArcEvent: Bool = false
-    @State private var showDeleteConfirmation = false
-    
     @State private var colorHex: String?
     @State private var customColor: Color = .accentColor
-    
     @State private var selectedPeople = Set<Person>()
     @State private var selectedLocations = Set<Location>()
+    @State private var showDeleteConfirmation = false
     
+    // Duration Input State
+    @State private var endDateMode: EndDateMode = .date
+    @State private var durationYears: Int = 0
+    @State private var durationMonths: Int = 0
+    @State private var durationDays: Int = 1
+    @State private var durationHours: Int = 0
+    @State private var durationMinutes: Int = 0
+    
+    // Tag-along State
     @State private var showAddPersonAlert = false
     @State private var newPersonName = ""
     @State private var showAddLocationAlert = false
     @State private var newLocationName = ""
     
-    private let presetColors: [ColorChoice] = ColorChoice.presets
+    private enum EndDateMode: String, CaseIterable, Identifiable {
+        case date = "By Date"
+        case duration = "By Duration"
+        var id: String { self.rawValue }
+    }
     
+    private let presetColors: [ColorChoice] = ColorChoice.presets
     private var unselectedPeople: [Person] { allPeople.filter { !selectedPeople.contains($0) } }
     private var unselectedLocations: [Location] { allLocations.filter { !selectedLocations.contains($0) } }
 
+    private var startDatePickerRange: ClosedRange<Date> {
+        displaySettings.constrainEventsToBounds ? timeline.dateRange : Date.distantPast...Date.distantFuture
+    }
+    
+    private var endDatePickerRange: ClosedRange<Date> {
+        displaySettings.constrainEventsToBounds ? startDate...timeline.endDate : startDate...Date.distantFuture
+    }
+    
     var body: some View {
         NavigationStack {
             Form {
@@ -1351,28 +1483,31 @@ struct EventEditorView: View {
                 }
                 
                 Section("Date & Time") {
-                    if !isArcEvent {
-                        Picker("Precision", selection: $precision.animation()) {
-                            ForEach(TimePrecision.allCases, id: \.self) { p in Text(p.description).tag(p) }
-                        }
-                        .pickerStyle(.segmented)
-                        .padding(.bottom, 4)
+                    Picker("Precision", selection: $precision.animation()) {
+                        ForEach(TimePrecision.allCases, id: \.self) { p in Text(p.description).tag(p) }
                     }
+                    .pickerStyle(.segmented)
+                    .padding(.bottom, 4)
 
-                    DatePicker("Start", selection: $startDate, in: timeline.dateRange, displayedComponents: precision == .time && !isArcEvent ? [.date, .hourAndMinute] : [.date])
+                    DatePicker("Start", selection: $startDate, in: startDatePickerRange, displayedComponents: precision == .time ? [.date, .hourAndMinute] : [.date])
+                        .id("start-\(precision.rawValue)-\(displaySettings.constrainEventsToBounds)")
 
                     Toggle("End Date", isOn: $hasEndDate.animation())
 
                     if hasEndDate {
-                        DatePicker(
-                            "End",
-                            selection: Binding(
-                                get: { endDate ?? startDate },
-                                set: { endDate = $0 }
-                            ),
-                            in: startDate...timeline.dateRange.upperBound,
-                            displayedComponents: precision == .time && !isArcEvent ? [.date, .hourAndMinute] : [.date]
-                        )
+                        Picker("Input Method", selection: $endDateMode.animation()) {
+                            ForEach(EndDateMode.allCases) { Text($0.rawValue).tag($0) }
+                        }
+                        .pickerStyle(.segmented)
+                        
+                        if endDateMode == .date {
+                            DatePicker("End", selection: Binding( get: { endDate ?? startDate }, set: { endDate = $0 }), in: endDatePickerRange, displayedComponents: precision == .time ? [.date, .hourAndMinute] : [.date]
+                            )
+                            .id("end-\(precision.rawValue)-\(displaySettings.constrainEventsToBounds)")
+                        } else {
+                            compoundDurationEditor
+                        }
+                        durationInfoView
                     }
                 }
                 
@@ -1406,22 +1541,64 @@ struct EventEditorView: View {
             }
             .onAppear(perform: setupInitialState)
             .onChange(of: customColor) { _, newColor in colorHex = newColor.toHex() }
-            .onChange(of: isArcEvent) { _, newIsArc in if newIsArc { precision = .day } }
-            .onChange(of: hasEndDate) { _, isEnabled in
-                if isEnabled {
-                    if endDate == nil {
-                        endDate = startDate.addingTimeInterval(3600)
-                    }
-                } else {
-                    endDate = nil
-                }
-            }
+            .onChange(of: hasEndDate) { _, newHasEndDate in if !newHasEndDate { endDate = nil } else if endDate == nil { updateEndDateFromDurationFields() } }
+            .onChange(of: endDate) { updateDurationFieldsFromEndDate() }
+            .onChange(of: endDateMode) { _, newMode in if newMode == .duration { updateDurationFieldsFromEndDate() } }
+            .onChange(of: durationComponents) { updateEndDateFromDurationFields() }
+            .onChange(of: precision) { _, newPrecision in if newPrecision == .day { durationHours = 0; durationMinutes = 0; updateEndDateFromDurationFields() } }
             .alert("Delete Event?", isPresented: $showDeleteConfirmation) { Button("Delete", role: .destructive, action: deleteEvent); Button("Cancel", role: .cancel) {} } message: { Text("This action cannot be undone.") }
             .alert("New Person", isPresented: $showAddPersonAlert) { TextField("Name", text: $newPersonName); Button("Add", action: createAndSelectPerson).disabled(newPersonName.trimmingCharacters(in: .whitespaces).isEmpty); Button("Cancel", role: .cancel) {} }
             .alert("New Location", isPresented: $showAddLocationAlert) { TextField("Name", text: $newLocationName); Button("Add", action: createAndSelectLocation).disabled(newLocationName.trimmingCharacters(in: .whitespaces).isEmpty); Button("Cancel", role: .cancel) {} }
         }
     }
     
+    @ViewBuilder private var compoundDurationEditor: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            durationInputRow(label: "Years", value: $durationYears)
+            durationInputRow(label: "Months", value: $durationMonths)
+            durationInputRow(label: "Days", value: $durationDays)
+            if precision == .time {
+                durationInputRow(label: "Hours", value: $durationHours)
+                durationInputRow(label: "Minutes", value: $durationMinutes)
+            }
+        }
+    }
+    
+    private func durationInputRow(label: String, value: Binding<Int>) -> some View {
+        HStack {
+            Text(label)
+            TextField("", value: value, format: .number)
+                .keyboardType(.numberPad)
+                .textFieldStyle(.roundedBorder)
+                .multilineTextAlignment(.trailing)
+            Stepper(label, value: value, in: 0...999).labelsHidden()
+        }
+    }
+    
+    @ViewBuilder private var durationInfoView: some View {
+        if let formatted = formattedDuration {
+            Text("Duration: \(formatted)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 4)
+        }
+    }
+    
+    private var durationComponents: [Int] { [durationYears, durationMonths, durationDays, durationHours, durationMinutes] }
+
+    private var formattedDuration: String? {
+        guard let endDate, hasEndDate, endDate > startDate else { return nil }
+        
+        let components = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: startDate, to: endDate)
+        let formatter = DateComponentsFormatter()
+        formatter.unitsStyle = .full
+        formatter.allowedUnits = [.year, .month, .day, .hour, .minute]
+        formatter.maximumUnitCount = 5
+        
+        return formatter.string(from: components)
+    }
+
     private func setupInitialState() {
         if let event {
             title = event.title; details = event.details; startDate = event.startDate; endDate = event.endDate; precision = event.precision; colorHex = event.colorHex; isArcEvent = event.isArcEvent
@@ -1429,19 +1606,49 @@ struct EventEditorView: View {
             selectedPeople = Set(event.people ?? []); selectedLocations = Set(event.locations ?? [])
             customColor = Color(hex: colorHex) ?? .accentColor
         } else {
-            let date = initialDate ?? Calendar.current.date(byAdding: .day, value: 1, to: timeline.dateRange.lowerBound) ?? .now
-            startDate = timeline.dateRange.contains(date) ? date : timeline.dateRange.lowerBound
+            startDate = initialDate ?? .now
+            if displaySettings.constrainEventsToBounds && !timeline.dateRange.contains(startDate) {
+                startDate = timeline.startDate
+            }
             hasEndDate = false
         }
+        updateDurationFieldsFromEndDate()
     }
     
     private func save() {
         let calendar = Calendar.current
-        let finalPrecision = isArcEvent ? .day : precision
+        let finalPrecision = precision
         let finalStartDate = finalPrecision == .day ? calendar.startOfDay(for: startDate) : startDate
         var finalEndDate: Date?
         if let currentEndDate = endDate, hasEndDate {
             finalEndDate = finalPrecision == .day ? calendar.startOfDay(for: currentEndDate) : currentEndDate
+        }
+        
+        if !displaySettings.constrainEventsToBounds {
+            let eventEffectiveEndDate = finalEndDate ?? finalStartDate
+            var newTimelineStartDate = timeline.startDate
+            var newTimelineEndDate = timeline.endDate
+
+            let didExpandStart = finalStartDate < newTimelineStartDate
+            let didExpandEnd = eventEffectiveEndDate > newTimelineEndDate
+
+            if didExpandStart { newTimelineStartDate = finalStartDate }
+            if didExpandEnd { newTimelineEndDate = eventEffectiveEndDate }
+
+            if didExpandStart || didExpandEnd {
+                let totalDuration = newTimelineEndDate.timeIntervalSince(newTimelineStartDate)
+                let buffer = totalDuration > 0 ? totalDuration * 0.05 : 86400.0 // 5% or 1 day
+                
+                if didExpandStart {
+                    newTimelineStartDate = newTimelineStartDate.addingTimeInterval(-buffer)
+                }
+                if didExpandEnd {
+                    newTimelineEndDate = newTimelineEndDate.addingTimeInterval(buffer)
+                }
+                
+                timeline.startDate = newTimelineStartDate
+                timeline.endDate = newTimelineEndDate
+            }
         }
 
         if let event {
@@ -1459,6 +1666,30 @@ struct EventEditorView: View {
     private func deleteEvent() { if let event { modelContext.delete(event) }; dismiss() }
     private func createAndSelectPerson() { let name = newPersonName.trimmingCharacters(in: .whitespaces); guard !name.isEmpty else { return }; let p = Person(name: name); modelContext.insert(p); selectedPeople.insert(p) }
     private func createAndSelectLocation() { let name = newLocationName.trimmingCharacters(in: .whitespaces); guard !name.isEmpty else { return }; let l = Location(name: name); modelContext.insert(l); selectedLocations.insert(l) }
+    
+    private func updateEndDateFromDurationFields() {
+        guard hasEndDate else { return }
+        let components = DateComponents(year: durationYears, month: durationMonths, day: durationDays, hour: durationHours, minute: durationMinutes)
+        if var newEndDate = Calendar.current.date(byAdding: components, to: startDate) {
+            if displaySettings.constrainEventsToBounds {
+                newEndDate = min(newEndDate, timeline.endDate)
+            }
+            endDate = newEndDate
+        }
+    }
+    
+    private func updateDurationFieldsFromEndDate() {
+        guard let endDate = self.endDate, endDate > startDate, hasEndDate else {
+            durationYears = 0; durationMonths = 0; durationDays = 1; durationHours = 0; durationMinutes = 0
+            return
+        }
+        let components = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: startDate, to: endDate)
+        durationYears = components.year ?? 0
+        durationMonths = components.month ?? 0
+        durationDays = components.day ?? 0
+        durationHours = components.hour ?? 0
+        durationMinutes = components.minute ?? 0
+    }
 }
 
 
