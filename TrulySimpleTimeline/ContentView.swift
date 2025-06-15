@@ -5,10 +5,10 @@ import SwiftData
 
 @Model
 final class Timeline {
-    @Attribute(.unique) var id: UUID
-    var name: String
-    var startDate: Date
-    var endDate: Date
+    var id: UUID = UUID()
+    var name: String = ""
+    var startDate: Date = Date.now
+    var endDate: Date = Date.now
     
     @Relationship(deleteRule: .cascade, inverse: \Event.timeline)
     var events: [Event]?
@@ -33,7 +33,7 @@ extension Timeline: Equatable {
 
 @Model
 final class Person {
-    @Attribute(.unique) var name: String
+    var name: String = ""
     var events: [Event]?
     
     init(name: String) {
@@ -43,7 +43,7 @@ final class Person {
 
 @Model
 final class Location {
-    @Attribute(.unique) var name: String
+    var name: String = ""
     var events: [Event]?
 
     init(name: String) {
@@ -67,11 +67,11 @@ enum TimelineOrientation {
 
 @Model
 final class Event {
-    var startDate: Date
+    var startDate: Date = Date.now
     var endDate: Date?
-    var title: String
-    var details: String
-    var precision: TimePrecision
+    var title: String = ""
+    var details: String = ""
+    var precision: TimePrecision = TimePrecision.day
     var colorHex: String?
     var isArcEvent: Bool = false
     
@@ -286,7 +286,11 @@ struct NoTimelinesView: View {
     
     var body: some View {
         ZStack {
+            #if os(iOS)
             Color(UIColor.systemGroupedBackground).ignoresSafeArea()
+            #else
+            Color(nsColor: .windowBackgroundColor).ignoresSafeArea()
+            #endif
             VStack(spacing: 12) {
                 Text("No Timelines")
                     .font(.title.bold())
@@ -386,9 +390,12 @@ struct TimelineDetailView: View {
                 .onAppear { timelineVisibleSize = geometry.size }
                 .onChange(of: geometry.size) { _, newSize in timelineVisibleSize = newSize }
                 .navigationTitle(timeline.name)
+                #if os(iOS)
                 .navigationBarTitleDisplayMode(.inline)
+                #endif
                 .toolbar {
-                    ToolbarItemGroup(placement: .navigationBarLeading) {
+                    // This group is for leading items on iOS and general items on macOS
+                    ToolbarItemGroup(placement: .principal) {
                         Button { showTimelineSelector = true } label: { Image(systemName: "list.bullet") }
                         
                         Button("Undo", systemImage: "arrow.uturn.backward") { undoRedoManager.performUndo(context: modelContext) }
@@ -397,6 +404,9 @@ struct TimelineDetailView: View {
                         Button("Redo", systemImage: "arrow.uturn.forward") { undoRedoManager.performRedo(context: modelContext) }
                             .disabled(!undoRedoManager.canRedo)
                     }
+                    
+                    // This group is for the bottom bar on iOS only
+                    #if os(iOS)
                     ToolbarItemGroup(placement: .bottomBar) {
                         Spacer()
                         Button {
@@ -409,7 +419,22 @@ struct TimelineDetailView: View {
                                 .presentationCompactAdaptation(.popover)
                         }
                     }
-                    ToolbarItemGroup(placement: .navigationBarTrailing) {
+                    #endif
+                    
+                    // This group is for trailing items on iOS and primary actions on macOS
+                    ToolbarItemGroup(placement: .primaryAction) {
+                        #if os(macOS)
+                        // On macOS, place the "Go To" button here.
+                        Button {
+                            showGoToMenu = true
+                        } label: {
+                            Label("Go To", systemImage: "magnifyingglass")
+                        }
+                        .popover(isPresented: $showGoToMenu) {
+                            goToMenuContent
+                        }
+                        #endif
+                        
                         Button { showEventEditor = true } label: { Image(systemName: "plus") }
                         Button { showDisplaySettings = true } label: { Image(systemName: "gearshape") }
                     }
@@ -448,8 +473,10 @@ struct TimelineDetailView: View {
                     centerDate = timeline.startDate.addingTimeInterval(totalDuration / 2.0)
                 }
             }
+            #if os(iOS)
             .toolbarBackground(.visible, for: .navigationBar, .bottomBar)
-            .toolbarBackground(Color(UIColor.systemGroupedBackground), for: .navigationBar, .bottomBar)
+            .toolbarBackground(Color(.systemGroupedBackground), for: .navigationBar, .bottomBar)
+            #endif
             .sheet(isPresented: $showDisplaySettings) { DisplaySettingsView(displaySettings: $displaySettings) }
             .sheet(isPresented: $showEventEditor) { EventEditorView(timeline: timeline, displaySettings: $displaySettings) }
             .sheet(item: $eventToEdit) { event in EventEditorView(event: event, timeline: timeline, displaySettings: $displaySettings) }
@@ -731,7 +758,9 @@ struct TimelineScrollView: View {
                             originalDuration: event.duration,
                             layoutFrame: layout.frame
                         )
+                        #if os(iOS)
                         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        #endif
                     }
                     self.dragOffset = value.translation
                 }
@@ -1230,7 +1259,10 @@ struct ScrollToDateView: View {
                 DatePicker("Select Date", selection: $selectedDate, in: timelineRange, displayedComponents: .date).datePickerStyle(.graphical).padding()
                 Button("Go to Date") { onDateSelected(selectedDate) }.buttonStyle(.borderedProminent)
             }
-            .navigationTitle("Go to Date").navigationBarTitleDisplayMode(.inline)
+            .navigationTitle("Go to Date")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
         }
     }
@@ -1260,7 +1292,10 @@ struct DisplaySettingsView: View {
                     Toggle("Constrain Events to Timeline Bounds", isOn: $displaySettings.constrainEventsToBounds)
                 }
             }
-            .navigationTitle("Display Settings").navigationBarTitleDisplayMode(.inline)
+            .navigationTitle("Display Settings")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") {
@@ -1298,11 +1333,16 @@ struct TimelineSelectorView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.dismiss) private var dismiss
     
+    // Get the PurchaseManager from the environment.
+    @Environment(PurchaseManager.self) private var purchaseManager
+    
     @Query(sort: \Timeline.name) private var timelines: [Timeline]
     @Binding var activeTimeline: Timeline?
     
     @State private var timelineToEdit: Timeline?
     @State private var showNewTimelineSheet = false
+    // Add state to control the paywall's visibility.
+    @State private var showPaywall = false
     
     var body: some View {
         NavigationStack {
@@ -1327,18 +1367,43 @@ struct TimelineSelectorView: View {
                 }
             }
             .navigationTitle("Timelines")
+            #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
+            #endif
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) { Button("Close") { dismiss() } }
-                ToolbarItem(placement: .topBarTrailing) { Button("New", systemImage: "plus") { showNewTimelineSheet = true } }
+                ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } }
+                ToolbarItem(placement: .primaryAction) {
+                    Button("New", systemImage: "plus") {
+                        // This is the core paywall logic.
+                        if timelines.count >= 1 && !purchaseManager.hasProAccess {
+                            showPaywall = true
+                        } else {
+                            showNewTimelineSheet = true
+                        }
+                    }
+                }
             }
             .sheet(isPresented: $showNewTimelineSheet) {
                 TimelineEditorView(onSave: { newTimeline in
                     activeTimeline = newTimeline
+                    // After creating a new one, we might need to dismiss this view.
+                    if !purchaseManager.hasProAccess {
+                        dismiss()
+                    }
                 })
             }
             .sheet(item: $timelineToEdit) { timeline in
                 TimelineEditorView(timelineToEdit: timeline)
+            }
+            // Add the sheet modifier for the PaywallView.
+            .sheet(isPresented: $showPaywall) {
+                PaywallView()
+            }
+            .onChange(of: purchaseManager.hasProAccess) { _, hasAccess in
+                // If the user successfully purchases, dismiss the paywall.
+                if hasAccess {
+                    showPaywall = false
+                }
             }
         }
     }
@@ -1359,8 +1424,8 @@ struct TimelineEditorView: View {
     var onSave: ((Timeline) -> Void)?
     
     @State private var name: String = ""
-    @State private var startDate: Date = .now
-    @State private var endDate: Date = .now.addingTimeInterval(86400)
+    @State private var startDate: Date = Date.now
+    @State private var endDate: Date = Date.now.addingTimeInterval(86400)
     
     private var isFormValid: Bool {
         !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && endDate > startDate
@@ -1376,7 +1441,9 @@ struct TimelineEditorView: View {
                 }
             }
             .navigationTitle(timelineToEdit == nil ? "New Timeline" : "Edit Timeline")
+            #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
+            #endif
             .onAppear(perform: setup)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
@@ -1422,7 +1489,7 @@ struct EventEditorView: View {
     // MARK: State
     @State private var title: String = ""
     @State private var details: String = ""
-    @State private var startDate: Date = .now
+    @State private var startDate: Date = Date.now
     @State private var endDate: Date? = nil
     @State private var hasEndDate: Bool = false
     @State private var precision: TimePrecision = .day
@@ -1517,7 +1584,7 @@ struct EventEditorView: View {
                             ForEach(Array(selectedPeople).sorted(by: { $0.name < $1.name })) { person in HStack { Text(person.name); Spacer(); Button { selectedPeople.remove(person) } label: { Image(systemName: "xmark.circle.fill").foregroundColor(.secondary) } }.buttonStyle(.borderless) }
                             Menu("Add Person") {
                                 if !unselectedPeople.isEmpty { ForEach(unselectedPeople) { p in Button(p.name) { selectedPeople.insert(p) } }; Divider() }
-                                Button("Add New Person...") { newPersonName = ""; showAddPersonAlert = true }
+                                Button("Add New Person...") { showAddPersonAlert = true }
                             }
                         }
                         
@@ -1525,7 +1592,7 @@ struct EventEditorView: View {
                             ForEach(Array(selectedLocations).sorted(by: { $0.name < $1.name })) { location in HStack { Text(location.name); Spacer(); Button { selectedLocations.remove(location) } label: { Image(systemName: "xmark.circle.fill").foregroundColor(.secondary) } }.buttonStyle(.borderless) }
                             Menu("Add Location") {
                                 if !unselectedLocations.isEmpty { ForEach(unselectedLocations) { l in Button(l.name) { selectedLocations.insert(l) } }; Divider() }
-                                Button("Add New Location...") { newLocationName = ""; showAddLocationAlert = true }
+                                Button("Add New Location...") { showAddLocationAlert = true }
                             }
                         }
                         Section("Description") { TextEditor(text: $details).frame(minHeight: 120) }
@@ -1534,7 +1601,10 @@ struct EventEditorView: View {
                 
                 if event != nil { Section { Button("Delete Event", role: .destructive) { showDeleteConfirmation = true } } }
             }
-            .navigationTitle(event == nil ? "New Event" : "Edit Event").navigationBarTitleDisplayMode(.inline)
+            .navigationTitle(event == nil ? "New Event" : "Edit Event")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) { Button("Save", action: save).disabled(title.isEmpty) }
@@ -1547,8 +1617,16 @@ struct EventEditorView: View {
             .onChange(of: durationComponents) { updateEndDateFromDurationFields() }
             .onChange(of: precision) { _, newPrecision in if newPrecision == .day { durationHours = 0; durationMinutes = 0; updateEndDateFromDurationFields() } }
             .alert("Delete Event?", isPresented: $showDeleteConfirmation) { Button("Delete", role: .destructive, action: deleteEvent); Button("Cancel", role: .cancel) {} } message: { Text("This action cannot be undone.") }
-            .alert("New Person", isPresented: $showAddPersonAlert) { TextField("Name", text: $newPersonName); Button("Add", action: createAndSelectPerson).disabled(newPersonName.trimmingCharacters(in: .whitespaces).isEmpty); Button("Cancel", role: .cancel) {} }
-            .alert("New Location", isPresented: $showAddLocationAlert) { TextField("Name", text: $newLocationName); Button("Add", action: createAndSelectLocation).disabled(newLocationName.trimmingCharacters(in: .whitespaces).isEmpty); Button("Cancel", role: .cancel) {} }
+            .alert("New Person", isPresented: $showAddPersonAlert) {
+                TextField("Name", text: $newPersonName)
+                Button("Add", action: createAndSelectPerson).disabled(newPersonName.trimmingCharacters(in: .whitespaces).isEmpty)
+                Button("Cancel", role: .cancel) {}
+            }
+            .alert("New Location", isPresented: $showAddLocationAlert) {
+                TextField("Name", text: $newLocationName)
+                Button("Add", action: createAndSelectLocation).disabled(newLocationName.trimmingCharacters(in: .whitespaces).isEmpty)
+                Button("Cancel", role: .cancel) {}
+            }
         }
     }
     
@@ -1568,7 +1646,9 @@ struct EventEditorView: View {
         HStack {
             Text(label)
             TextField("", value: value, format: .number)
+                #if os(iOS)
                 .keyboardType(.numberPad)
+                #endif
                 .textFieldStyle(.roundedBorder)
                 .multilineTextAlignment(.trailing)
             Stepper(label, value: value, in: 0...999).labelsHidden()
@@ -1606,7 +1686,7 @@ struct EventEditorView: View {
             selectedPeople = Set(event.people ?? []); selectedLocations = Set(event.locations ?? [])
             customColor = Color(hex: colorHex) ?? .accentColor
         } else {
-            startDate = initialDate ?? .now
+            startDate = initialDate ?? Date.now
             if displaySettings.constrainEventsToBounds && !timeline.dateRange.contains(startDate) {
                 startDate = timeline.startDate
             }
@@ -1664,8 +1744,34 @@ struct EventEditorView: View {
     }
     
     private func deleteEvent() { if let event { modelContext.delete(event) }; dismiss() }
-    private func createAndSelectPerson() { let name = newPersonName.trimmingCharacters(in: .whitespaces); guard !name.isEmpty else { return }; let p = Person(name: name); modelContext.insert(p); selectedPeople.insert(p) }
-    private func createAndSelectLocation() { let name = newLocationName.trimmingCharacters(in: .whitespaces); guard !name.isEmpty else { return }; let l = Location(name: name); modelContext.insert(l); selectedLocations.insert(l) }
+    
+    private func createAndSelectPerson() {
+        let name = newPersonName.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return }
+        
+        // Before creating, check if a person with this name already exists
+        let existing = allPeople.first { $0.name.caseInsensitiveCompare(name) == .orderedSame }
+        let personToSelect = existing ?? Person(name: name)
+        
+        if existing == nil {
+            modelContext.insert(personToSelect)
+        }
+        selectedPeople.insert(personToSelect)
+    }
+    
+    private func createAndSelectLocation() {
+        let name = newLocationName.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return }
+        
+        // Before creating, check if a location with this name already exists
+        let existing = allLocations.first { $0.name.caseInsensitiveCompare(name) == .orderedSame }
+        let locationToSelect = existing ?? Location(name: name)
+        
+        if existing == nil {
+            modelContext.insert(locationToSelect)
+        }
+        selectedLocations.insert(locationToSelect)
+    }
     
     private func updateEndDateFromDurationFields() {
         guard hasEndDate else { return }
@@ -1695,6 +1801,14 @@ struct EventEditorView: View {
 
 // MARK: - Color Helpers
 
+#if canImport(UIKit)
+import UIKit
+private typealias PlatformColor = UIColor
+#elseif canImport(AppKit)
+import AppKit
+private typealias PlatformColor = NSColor
+#endif
+
 struct ColorChoice: Identifiable, Hashable {
     let id: String, color: Color
     static let presets: [ColorChoice] = [
@@ -1723,8 +1837,8 @@ extension Color {
     }
     
     func toHex() -> String? {
-        let uic = UIColor(self)
-        guard let components = uic.cgColor.components, components.count >= 3 else { return nil }
+        let pColor = PlatformColor(self)
+        guard let components = pColor.cgColor.components, components.count >= 3 else { return nil }
         let r = Float(components[0]); let g = Float(components[1]); let b = Float(components[2])
         return String(format: "#%02lX%02lX%02lX", lroundf(r * 255), lroundf(g * 255), lroundf(b * 255))
     }
